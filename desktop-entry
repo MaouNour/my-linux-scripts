@@ -1,0 +1,38 @@
+#!/bin/bash
+if [ -z "$SHORTCUTS" ]; then
+  SHORTCUTS="$HOME/.local/share/applications"
+fi
+EXEC="$1"
+NAME="$2"
+ICON="$3"
+APPVER="$4"
+TYPE="$5"
+TERMINAL="$6"
+if [ -z "$NAME" ]; then
+  NAME=$EXEC
+fi
+if [ -z "$ICON" ]; then
+  ICON=$EXEC
+fi
+if [ -z "$APPVER" ]; then
+  APPVER="1.0"
+fi
+if [ -z "$TYPE" ]; then
+  TYPE="Application"
+fi
+if [ -z "$TERMINAL" ]; then
+  TERMINAL=false
+fi
+new_file="$SHORTCUTS/$NAME.desktop"
+touch "$new_file"
+#chmod +X "$new_file"
+{
+  echo "[Desktop Entry]"
+  echo "Encoding=UTF-8"
+  echo "Version=$APPVER"
+  echo "Type=$TYPE"
+  echo "Terminal=$TERMINAL"
+  echo "Exec=$EXEC"
+  echo "Name=$NAME"
+  echo "Icon=$ICON"
+} >>"$new_file"

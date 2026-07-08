@@ -1,0 +1,17 @@
+DIRECTORYBASE=/home/nour/.config/JetBrains/PhpStorm2021.1
+YEAR=2021
+VERSION=1
+	DIRECTORYPATH="$DIRECTORYBASE"
+	if [ -d "$DIRECTORYPATH" ]; then
+	rm $DIRECTORYPATH/eval/*
+	sed -i '/evlsprt/d' $DIRECTORYPATH/options/other.xml
+	rm -rf ~/.java/.userPrefs/jetbrains/phpstorm
+	#cp -r ~/.phpstorm/eval $DIRECTORYPATH/
+	#cp -r ~/.phpstorm/phpstorm ~/.java/.userPrefs/jetbrains/
+	echo -e "\e[32mPhpStorm $YEAR.$VERSION reset key evaluation file\e[0m"
+	else
+	echo -e "\e[31m Directory $DIRECTORYPATH not exists \e[0m"
+	fi;
+	
+
+

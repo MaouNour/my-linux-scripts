@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+import subprocess
+
+name = input("Enter Application Name: ")
+exec = input("Enter Executable Name/Location: (default is {$name}) ")
+icon = input("Enter Icon Name/Location: (default is {$name}) ")
+appversion = input("Enter appversion: (default is 1.0) ")
+apptype = input("Enter App Type: (default is Application) ")
+terminal = input("Terminal Application: [true/false(default)] ")
+if not exec:
+    exec = name
+proc = subprocess.Popen(
+    ["desktop-entry", exec, name, icon, appversion, apptype, terminal]
+)

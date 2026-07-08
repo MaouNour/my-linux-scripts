@@ -1,0 +1,4 @@
+#!/bin/bash
+ip=$(ip neighbor | grep -o -E "[0-9]+.[0-9]+.[0-9]+.[0-9]+")
+ftp="ftp://$ip:2121"
+nautilus "$ftp"

@@ -1,0 +1,4 @@
+#!/bin/bash
+rgb=$(zenity --color-selection)
+wl-copy "$rgb"
+#wl-paste

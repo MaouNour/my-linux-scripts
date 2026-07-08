@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+import random
+import sqlite3
+from pathlib import Path
+
+games = []
+##Paths
+LUTRIS_DIR = Path.home() / ".local/share/lutris"
+DATABASE_DIR = LUTRIS_DIR / "pga.db"
+
+
+##Helpers
+def get_connection():
+    conn = sqlite3.connect(DATABASE_DIR)
+    return conn
+
+
+def get_games_catogries():
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("""
+    SELECT * FROM categories
+              """)
+    rows = c.fetchall()
+    return rows
+
+
+def get_games_in_catogry(catnum):
+    conn = get_connection()
+    c = conn.cursor()
+    # query = "SELECT * FROM games_categories WHERE category_id="+str(catnum)
+    query = (
+        "SELECT name as Game FROM games JOIN games_categories WHERE games.id=games_categories.game_id and category_id="
+        + str(catnum)
+    )
+    c.execute(query)
+    rows = c.fetchall()
+    conn.close()
+    games = []
+    for row in rows:
+        for game in row:
+            games.append(game)
+    return games
+
+
+games_catogries = get_games_catogries()
+print(games_catogries)
+num = int(input("enter catogory number:"))
+games = get_games_in_catogry(num)
+while 1:
+    rand = random.randrange(0, len(games))
+    print(games[rand])
+    c = input()
+    if c in ["NO", "no", "No", "exit", "EXIT", "Exit", "q", "Quit", "quit", "QUIT"]:
+        break
+

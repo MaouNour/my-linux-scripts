@@ -1,0 +1,6 @@
+#!/bin/bash
+ip=$(ip neighbor | grep -o -E "[0-9]+.[0-9]+.[0-9]+.[0-9]+")
+if [ -z "$SCRCPY_PATH" ]; then
+  SCRCPY_PATH="$HOME/Documents/Apps/scrcpy-linux-x86_64-v4.0"
+fi
+adb connect "$ip" && "$SCRCPY_PATH"/scrcpy --stay-awake --window-borderless --shortcut-mod=lctrl -s "$ip"

@@ -1,0 +1,11 @@
+#!/bin/bash
+if [ -z "$1" ]; then
+  echo "Empty"
+fi
+for var in "$@"; do
+  if [ -z "$var" ]; then
+    echo "null"
+  else
+    desktop-entry "$var"
+  fi
+done

@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+import sqlite3
+import random
+import subprocess
+import threading
+import queue
+import sys
+from pathlib import Path
+from pydbus import SessionBus
+from gi.repository import GLib
+import os
+
+# --- Paths and extensions ---
+DB_PATH = Path.home() / ".local/share/music_index.db"
+AUDIO_EXTS = {".mp3", ".m4a", ".flac", ".ogg", ".wav", ".opus"}
+VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv"}
+SUPPORTED_EXTS = AUDIO_EXTS | VIDEO_EXTS
+
+# --- Globals ---
+playlist = []
+playlist_ids = []  # Track database IDs for currently playing playlist
+index = 0
+paused = False
+proc = None
+cmd_queue = queue.Queue()
+
+
+# --- Database helpers ---
+def get_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def get_playlist_tracks(playlist_name):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT id FROM playlists WHERE name = ?", (playlist_name,))
+    row = c.fetchone()
+    if not row:
+        print(f"❌ Playlist '{playlist_name}' does not exist.")
+        conn.close()
+        return [], []
+    playlist_id = row[0]
+    c.execute(
+        """
+        SELECT t.id, t.path
+        FROM tracks t
+        JOIN playlist_tracks pt ON t.id = pt.track_id
+        WHERE pt.playlist_id = ?
+        ORDER BY t.filename ASC
+    """,
+        (playlist_id,),
+    )
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        print(f"⚠️ Playlist '{playlist_name}' is empty.")
+    ids = [r[0] for r in rows]
+    paths = [r[1] for r in rows]
+    return paths, ids
+
+
+def add_current_to_playlist(current_id, playlist_name):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO playlists (name) VALUES (?)", (playlist_name,))
+    c.execute("SELECT id FROM playlists WHERE name = ?", (playlist_name,))
+    playlist_id = c.fetchone()[0]
+    try:
+        c.execute(
+            "INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_id) VALUES (?, ?)",
+            (playlist_id, current_id),
+        )
+        print(f"✅ Added track {current_id} to playlist '{playlist_name}'")
+    except Exception as e:
+        print(f"⚠️ Could not add track: {e}")
+    conn.commit()
+    conn.close()
+
+
+def remove_current_from_playlist(current_id, playlist_name):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT id FROM playlists WHERE name = ?", (playlist_name,))
+    row = c.fetchone()
+    if not row:
+        print(f"❌ Playlist '{playlist_name}' does not exist.")
+        conn.close()
+        return
+    playlist_id = row[0]
+    c.execute(
+        "DELETE FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?",
+        (playlist_id, current_id),
+    )
+    conn.commit()
+    conn.close()
+    print(f"✅ Removed track {current_id} from playlist '{playlist_name}'")
+
+
+# --- Folder scanning ---
+def scan_folder(folder):
+    folder = Path(folder).expanduser().resolve()
+    songs = []
+    for root, _, files in os.walk(folder):
+        for f in files:
+            if Path(f).suffix.lower() in SUPPORTED_EXTS:
+                songs.append(str(Path(root) / f))
+    return songs
+
+
+# --- Player controls ---
+def play_song():
+    global proc, paused
+    if not playlist:
+        print("⚠️ Playlist is empty.")
+        return
+    path = playlist[index]
+    print(f"\n🎧 Now playing [{index + 1}/{len(playlist)}]: {path}")
+    proc = subprocess.Popen(
+        ["ffplay", "-nodisp", "-vn", "-autoexit", "-loglevel", "quiet", path]
+    )
+    paused = False
+
+
+def stop_song():
+    global proc
+    if proc and proc.poll() is None:
+        proc.terminate()
+        proc.wait()
+
+
+def pause_song():
+    global paused
+    if proc and proc.poll() is not None:
+        return
+    if not paused:
+        proc.send_signal(19)  # SIGSTOP
+        paused = True
+        print("⏸️ Paused")
+
+
+def resume_song():
+    global paused
+    if proc and proc.poll() is not None:
+        return
+    if paused:
+        proc.send_signal(18)  # SIGCONT
+        paused = False
+        print("▶️ Resumed")
+
+
+def next_song():
+    global index
+    stop_song()
+    index = (index + 1) % len(playlist)
+    play_song()
+
+
+def prev_song():
+    global index
+    stop_song()
+    index = (index - 1) % len(playlist)
+    play_song()
+
+
+# --- MPRIS interface ---
+class MediaPlayer2:
+    """
+    <node>
+        <interface name='org.mpris.MediaPlayer2'>
+            <property name='CanQuit' type='b' access='read'/>
+            <property name='CanRaise' type='b' access='read'/>
+            <property name='HasTrackList' type='b' access='read'/>
+            <property name='Identity' type='s' access='read'/>
+            <property name='SupportedUriSchemes' type='as' access='read'/>
+            <property name='SupportedMimeTypes' type='as' access='read'/>
+        </interface>
+        <interface name='org.mpris.MediaPlayer2.Player'>
+            <method name='Play'/>
+            <method name='Pause'/>
+            <method name='PlayPause'/>
+            <method name='Stop'/>
+            <method name='Next'/>
+            <method name='Previous'/>
+        </interface>
+    </node>
+    """
+
+    CanQuit = False
+    CanRaise = False
+    HasTrackList = False
+    Identity = "FFPlay Shuffle Player"
+    SupportedUriSchemes = ["file"]
+    SupportedMimeTypes = ["audio/mpeg", "audio/x-m4a", "audio/flac", "audio/ogg"]
+
+    def Play(self):
+        if paused:
+            resume_song()
+        elif proc is None or proc.poll() is not None:
+            play_song()
+
+    def Pause(self):
+        pause_song()
+
+    def PlayPause(self):
+        if paused:
+            resume_song()
+        else:
+            pause_song()
+
+    def Stop(self):
+        stop_song()
+
+    def Next(self):
+        next_song()
+
+    def Previous(self):
+        prev_song()
+
+
+# --- D-Bus registration (old working style) ---
+bus = SessionBus()
+bus_name = "org.mpris.MediaPlayer2.ffplayplayer"
+try:
+    bus.publish(bus_name, ("/org/mpris/MediaPlayer2", MediaPlayer2()))
+    print(f"🎶 Registered MPRIS service as {bus_name}")
+except Exception as e:
+    print(f"⚠️ Could not register MPRIS service: {e}")
+
+
+# --- Monitor FFplay and auto-next ---
+def monitor_player():
+    global index
+    while True:
+        if proc:
+            ret = proc.poll()
+            if ret is not None:
+                index = (index + 1) % len(playlist)
+                play_song()
+        GLib.idle_add(lambda: None)
+        GLib.usleep(500000)  # 0.5s
+
+
+threading.Thread(target=monitor_player, daemon=True).start()
+
+
+# --- Interactive CLI in background ---
+def interactive_loop():
+    global index
+    while True:
+        cmd = input(
+            "Command (add <playlist>, remove <playlist>, next, prev, pause, play, quit): "
+        ).strip()
+        current_id = playlist_ids[index] if playlist_ids else None
+        if cmd.startswith("add ") and current_id:
+            add_current_to_playlist(current_id, cmd.replace("add ", "").strip())
+        elif cmd.startswith("remove ") and current_id:
+            remove_current_from_playlist(current_id, cmd.replace("remove ", "").strip())
+        elif cmd == "next":
+            next_song()
+        elif cmd == "prev":
+            prev_song()
+        elif cmd == "pause":
+            pause_song()
+        elif cmd == "play":
+            resume_song()
+        elif cmd == "quit":
+            stop_song()
+            print("👋 Exiting player.")
+            sys.exit(0)
+        else:
+            print("⚠️ Unknown command.")
+
+
+# --- Main ---
+def main():
+    global playlist, playlist_ids, index
+
+    if len(sys.argv) > 1 and sys.argv[1] != "--all":
+        playlist_name = sys.argv[1]
+        print(f"📂 Loading playlist: {playlist_name}")
+        playlist, playlist_ids = get_playlist_tracks(playlist_name)
+        if not playlist:
+            sys.exit(1)
+    else:
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute("SELECT id, path FROM tracks")
+        rows = c.fetchall()
+        conn.close()
+        playlist_ids = [r[0] for r in rows]
+        playlist = [r[1] for r in rows]
+        print(f"📂 Loaded {len(playlist)} tracks from library")
+
+    random.shuffle(playlist)
+    index = 0
+    play_song()
+
+    # Start CLI in a background thread
+    threading.Thread(target=interactive_loop, daemon=True).start()
+
+    # Start GLib main loop in main thread for MPRIS / media keys
+    loop = GLib.MainLoop()
+    try:
+        loop.run()
+    except KeyboardInterrupt:
+        stop_song()
+        print("\n👋 Exiting gracefully.")
+
+
+if __name__ == "__main__":
+    main()

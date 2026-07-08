@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+
+key="org.gnome.desktop.peripherals.touchpad"
+setting="send-events"
+current_state=$(gsettings get "$key" "$setting")
+
+case "$current_state" in
+    "'enabled'")
+        gsettings set "$key" "$setting" "disabled"
+        notify-send -i input-touchpad-symbolic "Touchpad" "Touchpad disabled"
+        ;;
+    "'disabled'" | "'disabled-on-external-mouse'")
+        gsettings set "$key" "$setting" "enabled"
+        notify-send -i input-touchpad-symbolic "Touchpad" "Touchpad enabled"
+        ;;
+    *)
+        notify-send -u critical "Touchpad Toggle Error" "Unknown state: $current_state"
+        echo "Unknown state: $current_state"
+        exit 1
+        ;;
+esac
+

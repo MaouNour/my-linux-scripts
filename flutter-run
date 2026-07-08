@@ -1,0 +1,25 @@
+#!/bin/bash
+projectsPath="$FLUTTER_PROJECTS"
+
+case "$1" in
+web)
+  project="$2"
+  if [ -d "$projectsPath/$project" ]; then
+    echo "Starting project '$project' in web..."
+    cd "$projectsPath/$project" || exit
+    flutter run -d chrome --web-port=8080 --web-hostname=127.0.0.1
+  else
+    echo "Couldn't find project '$project' in $projectsPath"
+  fi
+  ;;
+mobile)
+  echo "Not configured"
+  ;;
+list)
+  echo "Projects are:"
+  ls "$projectsPath"
+  ;;
+*)
+  echo "Command not available"
+  ;;
+esac

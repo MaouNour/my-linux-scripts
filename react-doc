@@ -1,0 +1,9 @@
+#!/bin/bash
+echo "cd"
+cd "$HOME/.websites/react.dev" || exit
+echo "yarn dev"
+yarn dev
+echo "open"
+open http://localhost:3000
+echo "opening in browser"
+xdg-open http://localhost:3000

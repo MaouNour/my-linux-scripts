@@ -1,0 +1,2 @@
+port=$1
+adb connect "10.42.0.63:$port" && scrcpy --stay-awake --window-borderless --shortcut-mod=lctrl

@@ -1,0 +1,14 @@
+#!/bin/bash
+res="$1"
+url="$2"
+subs_lang="$3"
+options=()
+if [ -n "$subs_lang" ]; then
+  options+=(
+    --write-subs
+    --write-auto-subs
+    --embed-subs
+    --sub-langs "$subs_lang"
+  )
+fi
+yt-dlp -f "bestvideo[height<=$res][ext=mp4]+bestaudio/best[height<=$res][ext=m4a]" -o '%(playlist)s/%(playlist_index)s - %(title)s.%(ext)s' '--embed-chapters' "${options[@]}" "$url"

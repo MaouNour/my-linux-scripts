@@ -1,0 +1,10 @@
+#!/bin/bash
+res="$1"
+url="$2"
+if [ -z "$YT_DLP_DEFAULT_RES" ]; then
+  YT_DLP_DEFAULT_RES="720"
+fi
+if [ -z "$res" ]; then
+  res=$YT_DLP_DEFAULT_RES
+fi
+yt-dlp -f "bestvideo[height<=$res][ext=mp4]+bestaudio/best[height<=$res][ext=m4a]" "$url"

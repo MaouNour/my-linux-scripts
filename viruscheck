@@ -1,0 +1,7 @@
+#!/bin/bash
+FOLDER="$1"
+if [ -z "$FOLDER" ]; then
+  FOLDER="."
+fi
+clamscan -r "$FOLDER" >>"$FOLDER/clamav.scan"
+cat "$FOLDER/clamav.scan" | grep FOUND

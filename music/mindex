@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+import os
+import sys
+import sqlite3
+from pathlib import Path
+import re
+
+# --- Config Paths ---
+CONFIG_DIR = Path.home() / ".config" / "shuffle_player"
+CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+LIB_FILE = CONFIG_DIR / "libraries.txt"
+
+DB_PATH = Path.home() / ".local/share/music_index.db"
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+# --- Supported formats ---
+AUDIO_EXTS = {".mp3", ".m4a", ".flac", ".ogg", ".wav", ".opus"}
+VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv"}
+SUPPORTED_EXTS = AUDIO_EXTS | VIDEO_EXTS
+
+
+# --- Database Helpers ---
+def get_connection():
+    """Open SQLite connection with foreign keys enabled."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_db():
+    """Initialize database and create necessary tables."""
+    conn = get_connection()
+    c = conn.cursor()
+
+    # Tracks table
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS tracks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        path TEXT UNIQUE,
+        filename TEXT
+    )
+    """)
+
+    # Playlists table
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS playlists (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE
+    )
+    """)
+
+    # Playlist-tracks association table
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS playlist_tracks (
+        playlist_id INTEGER,
+        track_id INTEGER,
+        UNIQUE(playlist_id, track_id),
+        FOREIGN KEY (playlist_id) REFERENCES playlists(id) ON DELETE CASCADE,
+        FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
+    )
+    """)
+
+    conn.commit()
+    return conn, c
+
+
+# --- Library Helpers ---
+def get_libraries():
+    if LIB_FILE.exists():
+        with open(LIB_FILE, "r", encoding="utf-8") as f:
+            return [
+                Path(line.strip()).expanduser().resolve() for line in f if line.strip()
+            ]
+    else:
+        default = Path.home() / "Music"
+        LIB_FILE.write_text(str(default) + "\n")
+        return [default]
+
+
+def add_library(folder):
+    folder = Path(folder).expanduser().resolve()
+    if not folder.exists():
+        print(f"❌ Folder does not exist: {folder}")
+        return
+    libs = get_libraries()
+    if folder in libs:
+        print(f"⚠️ Already in library list: {folder}")
+    else:
+        with open(LIB_FILE, "a", encoding="utf-8") as f:
+            f.write(str(folder) + "\n")
+        print(f"✅ Added folder to library: {folder}")
+
+
+def list_libraries():
+    libs = get_libraries()
+    print("🎶 Your music libraries:")
+    for lib in libs:
+        print(f"   • {lib}")
+
+
+# --- Scanning ---
+def scan_folder(folder):
+    folder = Path(folder).expanduser().resolve()
+    for root, _, files in os.walk(folder):
+        for f in files:
+            if Path(f).suffix.lower() in SUPPORTED_EXTS:
+                yield str(Path(root).resolve() / f)
+
+
+def scan_libraries():
+    libs = get_libraries()
+    conn, c = init_db()
+    new_count = 0
+
+    for lib in libs:
+        if not lib.exists():
+            print(f"⚠️ Library folder missing: {lib}")
+            continue
+        for path in scan_folder(lib):
+            try:
+                normalized_path = str(Path(path).resolve())
+                c.execute(
+                    "INSERT OR IGNORE INTO tracks (path, filename) VALUES (?, ?)",
+                    (normalized_path, Path(normalized_path).name),
+                )
+                new_count += c.rowcount
+            except Exception as e:
+                print(f"⚠️ Error adding {path}: {e}")
+
+    conn.commit()
+    conn.close()
+    print(f"✅ Scanning complete. Added {new_count} new files.")
+    print(f"📀 Database: {DB_PATH}")
+
+
+# --- Track Listing ---
+def list_tracks(folder_filter=None, ext_filter=None, search=None, sort_by_id=False):
+    if not DB_PATH.exists():
+        print("❌ Database not found. Run scan first.")
+        return
+
+    conn = get_connection()
+    c = conn.cursor()
+
+    query = "SELECT id, filename, path FROM tracks WHERE 1=1"
+    params = []
+
+    if folder_filter:
+        folder_path = str(Path(folder_filter).expanduser().resolve())
+        if not folder_path.endswith(os.sep):
+            folder_path += os.sep
+        query += " AND path LIKE ?"
+        params.append(f"{folder_path}%")
+
+    if ext_filter:
+        ext_conditions = []
+        for ext in ext_filter:
+            ext = ext.lower()
+            if not ext.startswith("."):
+                ext = "." + ext
+            ext_conditions.append("LOWER(filename) LIKE ?")
+            params.append(f"%{ext}")
+        query += " AND (" + " OR ".join(ext_conditions) + ")"
+
+    if search:
+        query += " AND LOWER(filename) LIKE ?"
+        params.append(f"%{search.lower()}%")
+
+    query += " ORDER BY id ASC" if sort_by_id else " ORDER BY filename ASC"
+
+    c.execute(query, params)
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        print("⚠️ No tracks match your criteria.")
+        return
+
+    print(f"🎵 Total tracks: {len(rows)}\n")
+    for track_id, filename, path in rows:
+        print(f"{track_id:4d} | {filename} | {path}")
+
+
+# --- Track Deletion ---
+def delete_track(track_id=None, filename=None):
+    if not DB_PATH.exists():
+        print("❌ Database not found.")
+        return
+    conn = get_connection()
+    c = conn.cursor()
+    if track_id:
+        c.execute("DELETE FROM tracks WHERE id = ?", (track_id,))
+    elif filename:
+        c.execute("DELETE FROM tracks WHERE filename = ?", (filename,))
+    else:
+        print("⚠️ Specify either track_id or filename to delete")
+        conn.close()
+        return
+    conn.commit()
+    conn.close()
+    print("✅ Track deleted from database.")
+
+
+def clear_tracks():
+    """Clear all tracks safely, respecting foreign key constraints."""
+    if not DB_PATH.exists():
+        print("❌ Database not found.")
+        return
+    conn = get_connection()
+    c = conn.cursor()
+    # clear dependent playlist_tracks first
+    c.execute("DELETE FROM playlist_tracks")
+    c.execute("DELETE FROM tracks")
+    c.execute("DELETE FROM sqlite_sequence WHERE name='tracks'")  # reset AUTOINCREMENT
+    conn.commit()
+    conn.close()
+    print("✅ All tracks removed from database and IDs reset.")
+
+
+# --- Playlist Functions ---
+def create_playlist(name):
+    if not name:
+        print("❌ Playlist name required.")
+        return
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO playlists (name) VALUES (?)", (name,))
+    conn.commit()
+    conn.close()
+    print(f"✅ Playlist '{name}' created.")
+
+
+def delete_playlist(playlist_name):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("DELETE FROM playlists WHERE name = ?", (playlist_name,))
+    conn.commit()
+    conn.close()
+    print(f"🗑️ Playlist '{playlist_name}' deleted.")
+
+
+def list_playlist_items():
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("""
+        SELECT p.name, COUNT(pt.track_id)
+        FROM playlists p
+        LEFT JOIN playlist_tracks pt ON p.id = pt.playlist_id
+        GROUP BY p.id
+    """)
+    items = c.fetchall()
+    conn.close()
+    return items
+
+
+def add_to_playlist(playlist_name, track_ids=None, filenames=None, regex=None):
+    conn = get_connection()
+    c = conn.cursor()
+
+    # ensure playlist exists
+    c.execute("SELECT id FROM playlists WHERE name = ?", (playlist_name,))
+    row = c.fetchone()
+    if not row:
+        c.execute("INSERT INTO playlists (name) VALUES (?)", (playlist_name,))
+        playlist_id = c.lastrowid
+        print(f"🆕 Created playlist '{playlist_name}'.")
+    else:
+        playlist_id = row[0]
+
+    tracks_to_add = set()
+
+    if track_ids:
+        placeholders = ",".join("?" * len(track_ids))
+        c.execute(f"SELECT id FROM tracks WHERE id IN ({placeholders})", track_ids)
+        for (tid,) in c.fetchall():
+            tracks_to_add.add(tid)
+
+    if filenames:
+        for fn in filenames:
+            c.execute("SELECT id FROM tracks WHERE filename = ?", (fn,))
+            row = c.fetchone()
+            if row:
+                tracks_to_add.add(row[0])
+
+    if regex:
+        pattern = re.compile(regex)
+        c.execute("SELECT id, filename FROM tracks")
+        for tid, fname in c.fetchall():
+            if pattern.search(fname):
+                tracks_to_add.add(tid)
+
+    for tid in tracks_to_add:
+        c.execute(
+            "INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_id) VALUES (?, ?)",
+            (playlist_id, tid),
+        )
+
+    conn.commit()
+    conn.close()
+    print(f"✅ Added {len(tracks_to_add)} tracks to playlist '{playlist_name}'.")
+
+
+def list_playlist(name):
+    conn = get_connection()
+    c = conn.cursor()
+
+    c.execute("SELECT id FROM playlists WHERE name = ?", (name,))
+    row = c.fetchone()
+    if not row:
+        print(f"❌ Playlist '{name}' does not exist.")
+        conn.close()
+        return
+    playlist_id = row[0]
+
+    c.execute(
+        """
+        SELECT t.id, t.filename, t.path
+        FROM tracks t
+        JOIN playlist_tracks pt ON t.id = pt.track_id
+        WHERE pt.playlist_id = ?
+        ORDER BY t.filename ASC
+    """,
+        (playlist_id,),
+    )
+    rows = c.fetchall()
+    conn.close()
+
+    print(f"🎵 Playlist '{name}' contains {len(rows)} tracks:")
+    for tid, fname, path in rows:
+        print(f"{tid:4d} | {fname} | {path}")
+
+
+# --- CLI Interface ---
+def main():
+    if len(sys.argv) < 2:
+        print("Usage:")
+        print(
+            "  mindex scan                        → Scan all libraries for audio/video"
+        )
+        print("  mindex add <folder>                → Add a new folder to library list")
+        print("  mindex list                        → Show all current library folders")
+        print(
+            "  mindex tracks [folder] [--ext=ext1,ext2] [--search=keyword] [--sort=id]"
+        )
+        print("  mindex delete [--id=<id>] [--filename=<name>]")
+        print("  mindex clear                        → Clear all tracks from DB")
+        print("  mindex playlist create <name>")
+        print("  mindex playlist delete <name>")
+        print(
+            "  mindex playlist add <name> [--id=1,2] [--filename=a.mp3,b.m4a] [--regex=<pat>]"
+        )
+        print("  mindex playlist list [<name>]")
+        sys.exit(0)
+
+    cmd = sys.argv[1].lower()
+
+    if cmd == "add" and len(sys.argv) > 2:
+        add_library(sys.argv[2])
+    elif cmd == "scan":
+        scan_libraries()
+    elif cmd == "list":
+        list_libraries()
+    elif cmd == "tracks":
+        folder_filter = None
+        ext_filter = None
+        search = None
+        sort_by_id = False
+        for arg in sys.argv[2:]:
+            if arg.startswith("--ext="):
+                ext_filter = arg.replace("--ext=", "").split(",")
+            elif arg.startswith("--search="):
+                search = arg.replace("--search=", "")
+            elif arg == "--sort=id":
+                sort_by_id = True
+            else:
+                folder_filter = arg
+        list_tracks(
+            folder_filter=folder_filter,
+            ext_filter=ext_filter,
+            search=search,
+            sort_by_id=sort_by_id,
+        )
+    elif cmd == "delete":
+        track_id = None
+        filename = None
+        for arg in sys.argv[2:]:
+            if arg.startswith("--id="):
+                track_id = int(arg.replace("--id=", ""))
+            elif arg.startswith("--filename="):
+                filename = arg.replace("--filename=", "")
+        delete_track(track_id=track_id, filename=filename)
+    elif cmd == "clear":
+        clear_tracks()
+    elif cmd == "playlist":
+        if len(sys.argv) < 3:
+            print(
+                "❌ Playlist command requires subcommand: create | add | list | delete"
+            )
+            sys.exit(0)
+        sub = sys.argv[2].lower()
+        if sub == "create" and len(sys.argv) > 3:
+            create_playlist(sys.argv[3])
+        elif sub == "delete" and len(sys.argv) > 3:
+            delete_playlist(sys.argv[3])
+        elif sub == "list":
+            if len(sys.argv) > 3:
+                list_playlist(sys.argv[3])
+            else:
+                playlists = list_playlist_items()
+                if playlists:
+                    print("🎶 Your playlists:")
+                    for name, count in playlists:
+                        print(f"  - {name} ({count} tracks)")
+                else:
+                    print("⚠️ No playlists found.")
+        elif sub == "add" and len(sys.argv) > 3:
+            playlist_name = sys.argv[3]
+            track_ids, filenames, regex = None, None, None
+            for arg in sys.argv[4:]:
+                if arg.startswith("--id="):
+                    track_ids = list(map(int, arg.replace("--id=", "").split(",")))
+                elif arg.startswith("--filename="):
+                    filenames = arg.replace("--filename=", "").split(",")
+                elif arg.startswith("--regex="):
+                    regex = arg.replace("--regex=", "")
+
+            # handle piped input
+            if not sys.stdin.isatty():
+                piped_lines = [line.strip() for line in sys.stdin if line.strip()]
+                if piped_lines:
+                    ids_from_pipe = [int(x) for x in piped_lines if x.isdigit()]
+                    files_from_pipe = [x for x in piped_lines if not x.isdigit()]
+                    if ids_from_pipe:
+                        track_ids = (track_ids or []) + ids_from_pipe
+                    if files_from_pipe:
+                        filenames = (filenames or []) + files_from_pipe
+
+            add_to_playlist(
+                playlist_name, track_ids=track_ids, filenames=filenames, regex=regex
+            )
+        else:
+            print("❌ Unknown playlist command or missing name.")
+    else:
+        print("❌ Unknown command.")
+
+
+if __name__ == "__main__":
+    main()

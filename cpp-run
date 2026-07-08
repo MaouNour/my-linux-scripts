@@ -1,0 +1,27 @@
+#!/bin/bash
+# run.sh - Compile and run a C++ file with optional flags
+
+# Collect arguments
+args=()
+file=""
+
+for arg in "$@"; do
+    if [[ "$arg" == -* ]]; then
+        args+=("$arg")
+    else
+        file="$arg"
+    fi
+done
+
+# Check if file was provided
+if [[ -z "$file" ]]; then
+    echo "Usage: $0 [options] file"
+    exit 1
+fi
+
+# Remove .cpp extension if present
+file="${file%.cpp}"
+
+# Compile and run
+g++ -o "$file" "$file.cpp" "${args[@]}" && "$file"
+

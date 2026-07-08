@@ -1,0 +1,108 @@
+#!/bin/python3
+import time
+import shutil
+import hashlib
+from pathlib import Path
+from datetime import datetime
+from threading import Timer, Lock
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+# ========= CONFIG =========
+WATCH_FILE = Path("./latest.pkt").resolve()
+VERSION_ROOT = Path("./_versions").resolve()
+SETTLE_SECONDS = 2.0
+STABLE_CHECKS = 3
+STABLE_INTERVAL = 0.5
+# ==========================
+
+def file_hash(path, chunk_size=1024 * 1024):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+class PacketTracerSaveHandler(FileSystemEventHandler):
+    def __init__(self):
+        self.timer = None
+        self.lock = Lock()
+        self.last_hash = None
+
+    def on_any_event(self, event):
+        if event.is_directory:
+            return
+
+        if Path(event.src_path).resolve() != WATCH_FILE:
+            return
+
+        with self.lock:
+            if self.timer:
+                self.timer.cancel()
+            self.timer = Timer(SETTLE_SECONDS, self.wait_and_save)
+            self.timer.start()
+
+    def wait_and_save(self):
+        last_size = -1
+        stable_count = 0
+
+        while stable_count < STABLE_CHECKS:
+            if not WATCH_FILE.exists():
+                time.sleep(STABLE_INTERVAL)
+                continue
+
+            size = WATCH_FILE.stat().st_size
+
+            if size > 0 and size == last_size:
+                stable_count += 1
+            else:
+                stable_count = 0
+
+            last_size = size
+            time.sleep(STABLE_INTERVAL)
+
+        self.save_version_if_changed()
+
+    def save_version_if_changed(self):
+        new_hash = file_hash(WATCH_FILE)
+
+        with self.lock:
+            if new_hash == self.last_hash:
+                return  # 🔒 identical content → skip
+
+            self.last_hash = new_hash
+
+        project_name = WATCH_FILE.stem
+        now = datetime.now()
+
+        date_folder = now.strftime("%Y-%m-%d")
+        time_stamp = now.strftime("%H-%M-%S")
+
+        dest_dir = VERSION_ROOT / project_name / date_folder
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        dest_file = dest_dir / f"{project_name}_{time_stamp}.pkt"
+        shutil.copy2(WATCH_FILE, dest_file)
+
+        print(f"💾 Auto-saved version: {dest_file}")
+
+def main():
+    handler = PacketTracerSaveHandler()
+    observer = Observer()
+    observer.schedule(handler, WATCH_FILE.parent, recursive=False)
+    observer.start()
+
+    print("👀 Watching Packet Tracer saves...")
+    print(f"📂 {WATCH_FILE}")
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+
+    observer.join()
+
+if __name__ == "__main__":
+    main()
+
