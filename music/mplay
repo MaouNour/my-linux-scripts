@@ -5,7 +5,10 @@ import subprocess
 import threading
 import queue
 import sys
+import time
+import shutil
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 from pydbus import SessionBus
 from gi.repository import GLib
 import os
@@ -23,6 +26,22 @@ index = 0
 paused = False
 proc = None
 cmd_queue = queue.Queue()
+mpris_player = None
+bus = None
+
+# playback position / capability tracking for MPRIS
+_play_started_at = 0.0     # time.time() when current song (re)started
+_position_at_start = 0.0   # seconds already elapsed at that moment
+_pause_started_at = None
+_current_volume = 1.0      # 0.0 - 1.0
+_current_length = 0.0      # seconds, from ffprobe (0 if unknown)
+_loop_status = "None"      # "None" | "Track" | "Playlist"
+_shuffle = False           # playlist is shuffled once at load; sequential thereafter unless toggled on
+
+# Guards every playback-state transition (play/stop/pause/resume/next/prev/
+# seek/advance) so the manual-command thread(s) and the monitor thread can
+# never both spawn/replace the ffplay process at the same time.
+_lock = threading.RLock()
 
 
 # --- Database helpers ---
@@ -109,59 +128,258 @@ def scan_folder(folder):
     return songs
 
 
+def get_track_length(path):
+    """Best-effort track duration in seconds via ffprobe. Returns 0.0 if unavailable."""
+    if not shutil.which("ffprobe"):
+        return 0.0
+    try:
+        out = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            capture_output=True, text=True, timeout=5,
+        )
+        return float(out.stdout.strip())
+    except Exception:
+        return 0.0
+
+
 # --- Player controls ---
-def play_song():
-    global proc, paused
-    if not playlist:
-        print("⚠️ Playlist is empty.")
+def play_song(start_offset=0.0):
+    global proc, paused, mpris_player
+    global _play_started_at, _position_at_start, _pause_started_at, _current_length
+
+    with _lock:
+        if not playlist:
+            print("⚠️ Playlist is empty.")
+            return
+
+        # Make absolutely sure nothing from a previous track is still running
+        # before we spawn a new process.
+        _stop_song_locked()
+
+        path = playlist[index]
+        print(f"\n🎧 Now playing [{index + 1}/{len(playlist)}]: {path}")
+
+        _current_length = get_track_length(path)
+
+        vol_pct = str(int(max(0.0, min(1.0, _current_volume)) * 100))
+        cmd = ["ffplay", "-nodisp", "-vn", "-autoexit", "-loglevel", "quiet", "-volume", vol_pct]
+        if start_offset > 0:
+            cmd += ["-ss", str(start_offset)]
+        cmd.append(path)
+
+        # start_new_session gives ffplay its own process group so we can
+        # reliably kill it (and any children it spawns) as a unit.
+        proc = subprocess.Popen(cmd, start_new_session=True)
+        paused = False
+        _position_at_start = start_offset
+        _play_started_at = time.time()
+        _pause_started_at = None
+
+        if mpris_player:
+            mpris_player.update_status("Playing")
+            mpris_player.update_metadata(path)
+
+
+def _stop_song_locked():
+    """Terminate the current process. Caller must already hold _lock."""
+    global proc
+    old = proc
+    proc = None  # detach immediately so nothing can mistake this process for "current"
+    if old is None or old.poll() is not None:
         return
-    path = playlist[index]
-    print(f"\n🎧 Now playing [{index + 1}/{len(playlist)}]: {path}")
-    proc = subprocess.Popen(
-        ["ffplay", "-nodisp", "-vn", "-autoexit", "-loglevel", "quiet", path]
-    )
-    paused = False
+
+    try:
+        pgid = os.getpgid(old.pid)
+    except ProcessLookupError:
+        return
+
+    # A stopped (paused, SIGSTOP'd) process won't act on SIGTERM until it's
+    # resumed, so make sure it's running before we ask it to terminate.
+    try:
+        os.killpg(pgid, 18)  # SIGCONT
+    except ProcessLookupError:
+        return
+
+    try:
+        os.killpg(pgid, 15)  # SIGTERM
+    except ProcessLookupError:
+        pass
+
+    for _ in range(10):  # poll for up to ~0.5s
+        if old.poll() is not None:
+            break
+        time.sleep(0.05)
+    else:
+        try:
+            os.killpg(pgid, 9)  # SIGKILL, unconditional
+        except ProcessLookupError:
+            pass
+
+    try:
+        old.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def stop_song():
-    global proc
-    if proc and proc.poll() is None:
-        proc.terminate()
-        proc.wait()
+    global mpris_player
+    with _lock:
+        _stop_song_locked()
+        if mpris_player:
+            mpris_player.update_status("Stopped")
 
 
 def pause_song():
-    global paused
-    if proc and proc.poll() is not None:
-        return
-    if not paused:
-        proc.send_signal(19)  # SIGSTOP
-        paused = True
-        print("⏸️ Paused")
+    global paused, mpris_player, _pause_started_at
+
+    with _lock:
+        if proc is None or proc.poll() is not None:
+            return
+
+        if not paused:
+            proc.send_signal(19)  # SIGSTOP
+            paused = True
+            _pause_started_at = time.time()
+            print("⏸️ Paused")
+
+            if mpris_player:
+                mpris_player.update_status("Paused")
 
 
 def resume_song():
-    global paused
-    if proc and proc.poll() is not None:
-        return
-    if paused:
-        proc.send_signal(18)  # SIGCONT
-        paused = False
-        print("▶️ Resumed")
+    global paused, mpris_player, _play_started_at, _pause_started_at
+
+    with _lock:
+        if proc is None or proc.poll() is not None:
+            return
+
+        if paused:
+            proc.send_signal(18)  # SIGCONT
+            if _pause_started_at is not None:
+                paused_duration = time.time() - _pause_started_at
+                _play_started_at += paused_duration
+            paused = False
+            _pause_started_at = None
+            print("▶️ Resumed")
+
+            if mpris_player:
+                mpris_player.update_status("Playing")
+
+
+def get_current_position():
+    """Approximate elapsed seconds into the current track."""
+    if not proc or proc.poll() is not None:
+        return _position_at_start
+    if paused and _pause_started_at is not None:
+        elapsed = _pause_started_at - _play_started_at
+    else:
+        elapsed = time.time() - _play_started_at
+    return _position_at_start + max(0.0, elapsed)
+
+
+def seek_relative(offset_seconds):
+    """Seek forward/backward by offset_seconds (ffplay has no IPC, so we restart at new offset)."""
+    with _lock:
+        if not playlist:
+            return
+        new_pos = get_current_position() + offset_seconds
+        new_pos = max(0.0, new_pos)
+        if _current_length > 0:
+            new_pos = min(new_pos, max(0.0, _current_length - 0.5))
+        play_song(start_offset=new_pos)
+
+
+def set_position_absolute(position_seconds):
+    with _lock:
+        if not playlist:
+            return
+        position_seconds = max(0.0, position_seconds)
+        if _current_length > 0:
+            position_seconds = min(position_seconds, max(0.0, _current_length - 0.5))
+        play_song(start_offset=position_seconds)
 
 
 def next_song():
     global index
-    stop_song()
-    index = (index + 1) % len(playlist)
-    play_song()
+    with _lock:
+        if not playlist:
+            return
+        index = (index + 1) % len(playlist)
+        play_song()
 
 
 def prev_song():
     global index
-    stop_song()
-    index = (index - 1) % len(playlist)
-    play_song()
+    with _lock:
+        if not playlist:
+            return
+        index = (index - 1) % len(playlist)
+        play_song()
+
+
+def advance_track():
+    """Called when a track finishes naturally; respects loop/shuffle state."""
+    global index
+    with _lock:
+        if not playlist:
+            return
+        if _loop_status == "Track":
+            play_song()
+            return
+        if _shuffle and len(playlist) > 1:
+            index = random.randrange(len(playlist))
+            play_song()
+            return
+        if index + 1 >= len(playlist):
+            if _loop_status == "Playlist":
+                index = 0
+                play_song()
+            else:
+                print("🏁 Playlist finished.")
+                _stop_song_locked()
+                if mpris_player:
+                    mpris_player.update_status("Stopped")
+            return
+        index += 1
+        play_song()
+
+
+def open_uri(uri):
+    """MPRIS OpenUri: add a file (path or file:// URI) to the playlist and play it."""
+    global playlist, playlist_ids, index
+    with _lock:
+        path = uri
+        if uri.startswith("file://"):
+            path = unquote(urlparse(uri).path)
+        if not Path(path).exists():
+            print(f"⚠️ File not found: {path}")
+            return
+        playlist.append(path)
+        playlist_ids.append(None)
+        index = len(playlist) - 1
+        play_song()
+
+
+# --- Helper to emit standard D-Bus PropertiesChanged signals ---
+def emit_properties_changed(interface_name, changed_props):
+    if not bus:
+        return
+    try:
+        variant = GLib.Variant("(sa{sv}as)", (interface_name, changed_props, []))
+        bus.con.emit_signal(
+            None,
+            "/org/mpris/MediaPlayer2",
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            variant,
+        )
+    except Exception as e:
+        print(f"⚠️ Could not emit PropertiesChanged: {e}")
 
 
 # --- MPRIS interface ---
@@ -169,6 +387,8 @@ class MediaPlayer2:
     """
     <node>
         <interface name='org.mpris.MediaPlayer2'>
+            <method name='Raise'/>
+            <method name='Quit'/>
             <property name='CanQuit' type='b' access='read'/>
             <property name='CanRaise' type='b' access='read'/>
             <property name='HasTrackList' type='b' access='read'/>
@@ -183,16 +403,143 @@ class MediaPlayer2:
             <method name='Stop'/>
             <method name='Next'/>
             <method name='Previous'/>
+            <method name='Seek'>
+                <arg direction='in' type='x' name='Offset'/>
+            </method>
+            <method name='SetPosition'>
+                <arg direction='in' type='o' name='TrackId'/>
+                <arg direction='in' type='x' name='Position'/>
+            </method>
+            <method name='OpenUri'>
+                <arg direction='in' type='s' name='Uri'/>
+            </method>
+            <property name='PlaybackStatus' type='s' access='read'/>
+            <property name='LoopStatus' type='s' access='readwrite'/>
+            <property name='Rate' type='d' access='read'/>
+            <property name='Shuffle' type='b' access='readwrite'/>
+            <property name='Metadata' type='a{sv}' access='read'/>
+            <property name='Volume' type='d' access='readwrite'/>
+            <property name='Position' type='x' access='read'/>
+            <property name='MinimumRate' type='d' access='read'/>
+            <property name='MaximumRate' type='d' access='read'/>
+            <property name='CanGoNext' type='b' access='read'/>
+            <property name='CanGoPrevious' type='b' access='read'/>
+            <property name='CanPlay' type='b' access='read'/>
+            <property name='CanPause' type='b' access='read'/>
+            <property name='CanSeek' type='b' access='read'/>
+            <property name='CanControl' type='b' access='read'/>
         </interface>
     </node>
     """
 
+    # --- org.mpris.MediaPlayer2 ---
     CanQuit = False
     CanRaise = False
     HasTrackList = False
     Identity = "FFPlay Shuffle Player"
     SupportedUriSchemes = ["file"]
-    SupportedMimeTypes = ["audio/mpeg", "audio/x-m4a", "audio/flac", "audio/ogg"]
+    SupportedMimeTypes = [
+        "audio/mpeg", "audio/x-m4a", "audio/flac", "audio/ogg",
+        "video/mp4", "video/x-matroska",
+    ]
+
+    def Raise(self):
+        pass  # no window to raise
+
+    def Quit(self):
+        stop_song()
+        sys.exit(0)
+
+    # --- org.mpris.MediaPlayer2.Player ---
+    PlaybackStatus = "Stopped"
+    Rate = 1.0
+    MinimumRate = 1.0
+    MaximumRate = 1.0
+    CanGoNext = True
+    CanGoPrevious = True
+    CanPlay = True
+    CanPause = True
+    CanSeek = True
+    CanControl = True
+
+    Metadata = {
+        "xesam:title": GLib.Variant("s", "Unknown"),
+        "xesam:artist": GLib.Variant("as", ["Unknown"]),
+        "xesam:album": GLib.Variant("s", "Unknown"),
+    }
+
+    @property
+    def LoopStatus(self):
+        return _loop_status
+
+    @LoopStatus.setter
+    def LoopStatus(self, value):
+        global _loop_status
+        if value in ("None", "Track", "Playlist"):
+            _loop_status = value
+            emit_properties_changed(
+                "org.mpris.MediaPlayer2.Player", {"LoopStatus": GLib.Variant("s", value)}
+            )
+
+    @property
+    def Shuffle(self):
+        return _shuffle
+
+    @Shuffle.setter
+    def Shuffle(self, value):
+        global _shuffle
+        _shuffle = bool(value)
+        emit_properties_changed(
+            "org.mpris.MediaPlayer2.Player", {"Shuffle": GLib.Variant("b", _shuffle)}
+        )
+
+    @property
+    def Volume(self):
+        return _current_volume
+
+    @Volume.setter
+    def Volume(self, value):
+        global _current_volume
+        _current_volume = max(0.0, min(1.0, float(value)))
+        # ffplay has no runtime volume IPC, so re-launch at the same position with new volume
+        if proc and proc.poll() is None:
+            pos = get_current_position()
+            stop_song()
+            play_song(start_offset=pos)
+        emit_properties_changed(
+            "org.mpris.MediaPlayer2.Player", {"Volume": GLib.Variant("d", _current_volume)}
+        )
+
+    @property
+    def Position(self):
+        return int(get_current_position() * 1_000_000)
+
+    def update_status(self, status):
+        self.PlaybackStatus = status
+        emit_properties_changed(
+            "org.mpris.MediaPlayer2.Player", {"PlaybackStatus": GLib.Variant("s", status)}
+        )
+
+    def update_metadata(self, path):
+        title = Path(path).stem
+        track_id = None
+        if playlist_ids and index < len(playlist_ids):
+            track_id = playlist_ids[index]
+        if track_id is None:
+            track_id = 0
+        trackid_path = f"/org/mpris/MediaPlayer2/Track/{track_id}"
+        length_us = int(_current_length * 1_000_000)
+
+        self.Metadata = {
+            "mpris:trackid": GLib.Variant("o", trackid_path),
+            "mpris:length": GLib.Variant("x", length_us),
+            "xesam:title": GLib.Variant("s", title),
+            "xesam:artist": GLib.Variant("as", ["Unknown"]),
+            "xesam:album": GLib.Variant("s", "FFPlay Shuffle Player"),
+        }
+        emit_properties_changed(
+            "org.mpris.MediaPlayer2.Player", {"Metadata": GLib.Variant("a{sv}", self.Metadata)}
+        )
 
     def Play(self):
         if paused:
@@ -218,12 +565,22 @@ class MediaPlayer2:
     def Previous(self):
         prev_song()
 
+    def Seek(self, offset):
+        seek_relative(offset / 1_000_000.0)
 
-# --- D-Bus registration (old working style) ---
+    def SetPosition(self, track_id, position):
+        set_position_absolute(position / 1_000_000.0)
+
+    def OpenUri(self, uri):
+        open_uri(uri)
+
+
+# --- D-Bus registration ---
 bus = SessionBus()
 bus_name = "org.mpris.MediaPlayer2.ffplayplayer"
 try:
-    bus.publish(bus_name, ("/org/mpris/MediaPlayer2", MediaPlayer2()))
+    mpris_player = MediaPlayer2()
+    bus.publish(bus_name, ("/org/mpris/MediaPlayer2", mpris_player))
     print(f"🎶 Registered MPRIS service as {bus_name}")
 except Exception as e:
     print(f"⚠️ Could not register MPRIS service: {e}")
@@ -231,13 +588,14 @@ except Exception as e:
 
 # --- Monitor FFplay and auto-next ---
 def monitor_player():
-    global index
     while True:
-        if proc:
-            ret = proc.poll()
-            if ret is not None:
-                index = (index + 1) % len(playlist)
-                play_song()
+        with _lock:
+            watched_proc = proc
+            if watched_proc is not None and watched_proc.poll() is not None:
+                # Re-check identity: another thread may have already replaced
+                # `proc` (e.g. a manual Next) between the poll above and here.
+                if proc is watched_proc:
+                    advance_track()
         GLib.idle_add(lambda: None)
         GLib.usleep(500000)  # 0.5s
 
