@@ -7,6 +7,7 @@ import queue
 import sys
 import time
 import shutil
+import json
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 from pydbus import SessionBus
@@ -18,6 +19,11 @@ DB_PATH = Path.home() / ".local/share/music_index.db"
 AUDIO_EXTS = {".mp3", ".m4a", ".flac", ".ogg", ".wav", ".opus"}
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv"}
 SUPPORTED_EXTS = AUDIO_EXTS | VIDEO_EXTS
+
+# --- Loudness normalization (EBU R128 via ffmpeg's loudnorm filter) ---
+LOUDNESS_TARGET_LUFS = -16.0   # typical target for personal music playback
+LOUDNESS_MAX_BOOST_DB = 12.0   # never boost a quiet/silent file more than this
+LOUDNESS_MAX_CUT_DB = 15.0     # never cut an already-loud file more than this
 
 # --- Globals ---
 playlist = []
@@ -147,6 +153,110 @@ def get_track_length(path):
         return 0.0
 
 
+# --- Loudness normalization ---
+def init_loudness_table():
+    conn = get_connection()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS loudness_cache (
+            path TEXT PRIMARY KEY,
+            mtime REAL NOT NULL,
+            integrated_lufs REAL NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def _cached_loudness(path, mtime):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute(
+        "SELECT integrated_lufs FROM loudness_cache WHERE path = ? AND mtime = ?",
+        (path, mtime),
+    )
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def _store_loudness(path, mtime, lufs):
+    conn = get_connection()
+    conn.execute(
+        "INSERT OR REPLACE INTO loudness_cache (path, mtime, integrated_lufs) VALUES (?, ?, ?)",
+        (path, mtime, lufs),
+    )
+    conn.commit()
+    conn.close()
+
+
+def measure_loudness(path):
+    """Single-pass ffmpeg loudnorm analysis. Returns integrated LUFS, or None on failure."""
+    if not shutil.which("ffmpeg"):
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-nostats", "-i", path,
+                "-vn", "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
+                "-f", "null", "-",
+            ],
+            capture_output=True, text=True, timeout=180,
+        )
+        stderr = result.stderr
+        start = stderr.rfind("{")
+        end = stderr.rfind("}")
+        if start == -1 or end == -1 or end < start:
+            return None
+        data = json.loads(stderr[start:end + 1])
+        return float(data["input_i"])
+    except Exception as e:
+        print(f"⚠️ Loudness analysis failed for {Path(path).name}: {e}")
+        return None
+
+
+def get_loudness_gain_db(path):
+    """dB gain to bring `path` to LOUDNESS_TARGET_LUFS. Measures + caches on first use."""
+    try:
+        mtime = Path(path).stat().st_mtime
+    except OSError:
+        return 0.0
+
+    lufs = _cached_loudness(path, mtime)
+    if lufs is None:
+        print(f"🔍 Analyzing loudness (first play): {Path(path).name}")
+        lufs = measure_loudness(path)
+        if lufs is None:
+            return 0.0
+        _store_loudness(path, mtime, lufs)
+
+    gain = LOUDNESS_TARGET_LUFS - lufs
+    return max(-LOUDNESS_MAX_CUT_DB, min(LOUDNESS_MAX_BOOST_DB, gain))
+
+
+def prewarm_loudness_cache():
+    """Background pass that measures every not-yet-cached track in the current
+    playlist (starting from the current song), so later plays are instant."""
+    with _lock:
+        order = list(range(index, len(playlist))) + list(range(0, index))
+        snapshot = list(playlist)
+    for i in order:
+        if i >= len(snapshot):
+            continue
+        path = snapshot[i]
+        try:
+            mtime = Path(path).stat().st_mtime
+        except OSError:
+            continue
+        if _cached_loudness(path, mtime) is not None:
+            continue
+        lufs = measure_loudness(path)
+        if lufs is not None:
+            _store_loudness(path, mtime, lufs)
+        time.sleep(0.2)  # be polite to CPU/disk while music is actively playing
+
+
 # --- Player controls ---
 def play_song(start_offset=0.0):
     global proc, paused, mpris_player
@@ -156,18 +266,30 @@ def play_song(start_offset=0.0):
         if not playlist:
             print("⚠️ Playlist is empty.")
             return
+        path = playlist[index]
+        this_index = index
 
-        # Make absolutely sure nothing from a previous track is still running
-        # before we spawn a new process.
+    # ffprobe (length) and loudnorm analysis (gain) can take a while on a
+    # track's first play. Do them without holding _lock so next/prev/pause
+    # etc. never block behind an analysis run.
+    length = get_track_length(path)
+    gain_db = get_loudness_gain_db(path)
+
+    with _lock:
+        # If the selection changed while we were analyzing (e.g. the user
+        # hit Next mid-analysis), bail out rather than playing a stale track.
+        if not playlist or index != this_index or playlist[index] != path:
+            return
+
         _stop_song_locked()
 
-        path = playlist[index]
         print(f"\n🎧 Now playing [{index + 1}/{len(playlist)}]: {path}")
-
-        _current_length = get_track_length(path)
+        _current_length = length
 
         vol_pct = str(int(max(0.0, min(1.0, _current_volume)) * 100))
         cmd = ["ffplay", "-nodisp", "-vn", "-autoexit", "-loglevel", "quiet", "-volume", vol_pct]
+        if abs(gain_db) > 0.05:
+            cmd += ["-af", f"volume={gain_db:.2f}dB"]
         if start_offset > 0:
             cmd += ["-ss", str(start_offset)]
         cmd.append(path)
@@ -635,6 +757,8 @@ def interactive_loop():
 def main():
     global playlist, playlist_ids, index
 
+    init_loudness_table()
+
     if len(sys.argv) > 1 and sys.argv[1] != "--all":
         playlist_name = sys.argv[1]
         print(f"📂 Loading playlist: {playlist_name}")
@@ -654,6 +778,10 @@ def main():
     random.shuffle(playlist)
     index = 0
     play_song()
+
+    # Quietly pre-analyze the rest of the library's loudness in the background
+    # so future plays don't pay the first-time analysis cost.
+    threading.Thread(target=prewarm_loudness_cache, daemon=True).start()
 
     # Start CLI in a background thread
     threading.Thread(target=interactive_loop, daemon=True).start()
