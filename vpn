@@ -39,6 +39,14 @@ LOG="/var/log/vpnns-openvpn.log"
 die() { echo "Error: $*" >&2; exit 1; }
 need_root() { [ "$(id -u)" -eq 0 ] || die "this needs sudo"; }
 
+# NOTE: don't check existence via `ip netns list | grep -qx "$NS"`.
+# Once anything (e.g. moving the veth peer into the namespace) causes the
+# kernel to assign the namespace an nsid, `ip netns list` starts printing
+# "vpnns (id: 0)" instead of just "vpnns", which breaks an exact-match
+# grep and makes an already-running namespace look like it doesn't exist.
+# Checking for the namespace's bind-mount file directly is immune to that.
+ns_exists() { [ -e "/var/run/netns/$NS" ]; }
+
 default_iface() { ip route show default | awk '{print $5; exit}'; }
 
 start() {
@@ -46,7 +54,7 @@ start() {
   local config="${1:-}"
   [ -n "$config" ] && [ -f "$config" ] || die "usage: start /path/to/client.ovpn"
 
-  ip netns list | grep -qx "$NS" && die "namespace '$NS' already exists - run 'stop' first"
+  ns_exists && die "namespace '$NS' already exists - run 'stop' first"
 
   local iface
   iface=$(default_iface)
@@ -94,7 +102,7 @@ start() {
 }
 
 run() {
-  ip netns list | grep -qx "$NS" || die "namespace '$NS' doesn't exist - run 'start' first"
+  ns_exists || die "namespace '$NS' doesn't exist - run 'start' first"
   [ $# -gt 0 ] || die "usage: run <command> [args...]"
   [ "$1" = "--" ] && shift
 
@@ -110,7 +118,7 @@ run() {
 }
 
 status() {
-  if ip netns list | grep -qx "$NS"; then
+  if ns_exists; then
     echo "Namespace '$NS' exists."
     if [ -f "$PID_FILE" ] && ps -p "$(cat "$PID_FILE")" &>/dev/null; then
       echo "OpenVPN running inside it (pid $(cat "$PID_FILE"))."
@@ -136,7 +144,7 @@ stop() {
     sleep 1
     rm -f "$PID_FILE"
   fi
-  ip netns list | grep -qx "$NS" && ip netns delete "$NS" || true
+  ns_exists && ip netns delete "$NS" || true
   ip link show "$VETH_HOST" &>/dev/null && ip link delete "$VETH_HOST" || true
 
   local iface
