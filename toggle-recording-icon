@@ -1,0 +1,7 @@
+#!/bin/bash
+toggle=$(grep '"not-recording": ""' ~/.config/waybar/modules.json)
+if [ -z "$toggle" ]; then
+  sed --in-place 's/"not-recording": "🚫"/"not-recording": ""/g' ~/.config/waybar/modules.json
+else
+  sed --in-place 's/"not-recording": ""/"not-recording": "🚫"/g' ~/.config/waybar/modules.json
+fi

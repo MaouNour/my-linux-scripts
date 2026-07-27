@@ -1,0 +1,158 @@
+#!/bin/bash
+#
+# vpn-ns.sh - per-application VPN split tunneling using a network namespace.
+#
+# Idea: OpenVPN runs INSIDE an isolated network namespace ("vpnns"). Only
+# programs you explicitly launch through this script run inside that
+# namespace and get routed through the VPN. Everything else on your system
+# (browser, etc.) keeps using your normal wifi/ethernet, completely
+# unaffected.
+#
+# Requires: openvpn, iptables, iproute2 (all standard on Fedora), root.
+#
+# Usage:
+#   sudo ./vpn-ns.sh start /path/to/client.ovpn
+#   ./vpn-ns.sh run firefox                 # launches firefox inside the VPN namespace
+#   ./vpn-ns.sh run -- transmission-gtk     # anything after run/-- goes through VPN
+#   sudo ./vpn-ns.sh status
+#   sudo ./vpn-ns.sh stop
+#
+# Notes:
+#  - "run" does NOT need sudo itself; it re-execs the target app as your
+#    normal user, just inside the vpn namespace, so GUI apps keep working
+#    normally (same X session, same user, same GPU access etc).
+#  - DNS inside the namespace is set separately (see DNS_SERVERS below) so
+#    the isolated apps don't leak your normal resolver.
+
+set -euo pipefail
+
+NS="vpnns"
+VETH_HOST="veth-host"
+VETH_NS="veth-ns"
+HOST_IP="10.200.200.1/24"
+NS_IP="10.200.200.2/24"
+SUBNET="10.200.200.0/24"
+DNS_SERVERS="1.1.1.1 8.8.8.8"
+PID_FILE="/var/run/vpnns-openvpn.pid"
+LOG="/var/log/vpnns-openvpn.log"
+
+die() { echo "Error: $*" >&2; exit 1; }
+need_root() { [ "$(id -u)" -eq 0 ] || die "this needs sudo"; }
+
+default_iface() { ip route show default | awk '{print $5; exit}'; }
+
+start() {
+  need_root
+  local config="${1:-}"
+  [ -n "$config" ] && [ -f "$config" ] || die "usage: start /path/to/client.ovpn"
+
+  ip netns list | grep -qx "$NS" && die "namespace '$NS' already exists - run 'stop' first"
+
+  local iface
+  iface=$(default_iface)
+  [ -n "$iface" ] || die "couldn't detect your default network interface"
+
+  echo "Setting up namespace '$NS' (host default interface: $iface)..."
+
+  ip netns add "$NS"
+  ip link add "$VETH_HOST" type veth peer name "$VETH_NS"
+  ip link set "$VETH_NS" netns "$NS"
+
+  ip addr add "$HOST_IP" dev "$VETH_HOST"
+  ip link set "$VETH_HOST" up
+
+  ip netns exec "$NS" ip addr add "$NS_IP" dev "$VETH_NS"
+  ip netns exec "$NS" ip link set "$VETH_NS" up
+  ip netns exec "$NS" ip link set lo up
+  ip netns exec "$NS" ip route add default via "${HOST_IP%/*}"
+
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+  iptables -t nat -C POSTROUTING -s "$SUBNET" -o "$iface" -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -s "$SUBNET" -o "$iface" -j MASQUERADE
+  iptables -C FORWARD -i "$VETH_HOST" -o "$iface" -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i "$VETH_HOST" -o "$iface" -j ACCEPT
+  iptables -C FORWARD -i "$iface" -o "$VETH_HOST" -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i "$iface" -o "$VETH_HOST" -j ACCEPT
+
+  mkdir -p "/etc/netns/$NS"
+  : > "/etc/netns/$NS/resolv.conf"
+  for d in $DNS_SERVERS; do echo "nameserver $d" >> "/etc/netns/$NS/resolv.conf"; done
+
+  echo "Starting OpenVPN inside the namespace..."
+  ip netns exec "$NS" openvpn --config "$config" \
+    --daemon vpnns-openvpn \
+    --writepid "$PID_FILE" \
+    --log "$LOG"
+
+  sleep 3
+  if [ -f "$PID_FILE" ] && ps -p "$(cat "$PID_FILE")" &>/dev/null; then
+    echo "VPN namespace is up. Use './vpn-ns.sh run <app>' to route an app through it."
+  else
+    echo "Warning: openvpn may not have started correctly - check $LOG" >&2
+  fi
+}
+
+run() {
+  ip netns list | grep -qx "$NS" || die "namespace '$NS' doesn't exist - run 'start' first"
+  [ $# -gt 0 ] || die "usage: run <command> [args...]"
+  [ "$1" = "--" ] && shift
+
+  local real_user="${SUDO_USER:-$USER}"
+
+  # sudo is required only to switch namespaces; the app itself runs as your
+  # normal user so GUI apps keep access to your X/Wayland session.
+  exec sudo ip netns exec "$NS" \
+    runuser -u "$real_user" -- \
+    env DISPLAY="${DISPLAY:-}" XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
+        WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+        "$@"
+}
+
+status() {
+  if ip netns list | grep -qx "$NS"; then
+    echo "Namespace '$NS' exists."
+    if [ -f "$PID_FILE" ] && ps -p "$(cat "$PID_FILE")" &>/dev/null; then
+      echo "OpenVPN running inside it (pid $(cat "$PID_FILE"))."
+      echo
+      echo "Public IP as seen from OUTSIDE the namespace (your normal connection):"
+      curl -s --max-time 5 https://ifconfig.me || echo "  (couldn't check)"
+      echo
+      echo "Public IP as seen from INSIDE the namespace (should be the VPN's):"
+      ip netns exec "$NS" curl -s --max-time 5 https://ifconfig.me || echo "  (couldn't check)"
+      echo
+    else
+      echo "OpenVPN is not running inside it - something went wrong."
+    fi
+  else
+    echo "Not running."
+  fi
+}
+
+stop() {
+  need_root
+  if [ -f "$PID_FILE" ]; then
+    kill "$(cat "$PID_FILE")" 2>/dev/null || true
+    sleep 1
+    rm -f "$PID_FILE"
+  fi
+  ip netns list | grep -qx "$NS" && ip netns delete "$NS" || true
+  ip link show "$VETH_HOST" &>/dev/null && ip link delete "$VETH_HOST" || true
+
+  local iface
+  iface=$(default_iface)
+  iptables -t nat -D POSTROUTING -s "$SUBNET" -o "$iface" -j MASQUERADE 2>/dev/null || true
+  iptables -D FORWARD -i "$VETH_HOST" -o "$iface" -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -i "$iface" -o "$VETH_HOST" -j ACCEPT 2>/dev/null || true
+
+  rm -rf "/etc/netns/$NS"
+  echo "Cleaned up."
+}
+
+case "${1:-}" in
+  start) shift; start "$@" ;;
+  run) shift; run "$@" ;;
+  status) status ;;
+  stop) stop ;;
+  *) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
