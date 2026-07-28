@@ -1,0 +1,4 @@
+export SteamAppId=3483510
+export STEAM_COMPAT_DATA_PATH="/home/YOUR_USERNAME/.local/share/Steam/steamapps/compatdata/3217534023"
+export STEAM_COMPAT_CLIENT_INSTALL_PATH="/home/YOUR_USERNAME/.local/share/Steam"
+game-performance gamemoderun "/home/YOUR_USERNAME/.local/share/Steam/compatibilitytools.d/YOUR_MODIFIED_PROTON/proton" run  "/home/YOUR_USERNAME/Games/The Adventures of Elliot_The Millennium Tales/Elliot.exe"

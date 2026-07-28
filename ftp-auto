@@ -1,4 +1,55 @@
-#!/bin/bash
-ip=$(ip neighbor | grep -o -E "[0-9]+.[0-9]+.[0-9]+.[0-9]+")
-ftp="ftp://$ip:2121"
-nautilus "$ftp"
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+FTP_PORT=2121
+
+get_neighbors() {
+  ip -4 neigh |
+    awk '$NF != "FAILED" {print $1}' |
+    sort -u
+}
+
+has_ftp() {
+  local ip="$1"
+
+  timeout 0.5 bash -c \
+    "echo >/dev/tcp/$ip/$FTP_PORT" \
+    &>/dev/null
+}
+
+find_ftp_hosts() {
+  local ip
+
+  while read -r ip; do
+    has_ftp "$ip" && echo "$ip"
+  done
+}
+
+choose_hosts() {
+  gum choose --no-limit
+}
+
+open_hosts() {
+  local ip
+
+  while read -r ip; do
+    xdg-open "ftp://$ip:$FTP_PORT" &
+  done
+}
+
+main() {
+  local ftp_hosts
+
+  ftp_hosts="$(get_neighbors | find_ftp_hosts || true)"
+
+  if [[ -z $ftp_hosts ]]; then
+    echo "No FTP hosts found."
+    return 1
+  fi
+
+  printf '%s\n' "$ftp_hosts" |
+    choose_hosts |
+    open_hosts
+}
+main

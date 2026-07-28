@@ -1,6 +1,53 @@
 #!/bin/bash
-ip=$(ip neighbor | grep -o -E "[0-9]+.[0-9]+.[0-9]+.[0-9]+")
-if [ -z "$SCRCPY_PATH" ]; then
-  SCRCPY_PATH="$HOME/Documents/Apps/scrcpy-linux-x86_64-v4.0"
-fi
-adb connect "$ip" && "$SCRCPY_PATH"/scrcpy --stay-awake --window-borderless --shortcut-mod=lctrl -s "$ip"
+# set -euo pipefail
+PORT_NUM="5555"
+get_neighbors() {
+  ip -4 neigh |
+    awk '$NF != "FAILED" {print $1}' |
+    sort -u
+}
+has_tcpip() {
+  local ip="$1"
+
+  timeout 0.5 bash -c \
+    "echo >/dev/tcp/$ip/$PORT_NUM" \
+    &>/dev/null
+}
+find_tcpip_hosts() {
+  local ip
+
+  while read -r ip; do
+    has_tcpip "$ip" && echo "$ip"
+  done
+}
+choose_hosts() {
+  gum choose --no-limit
+}
+open_mobile() {
+  local ip
+
+  while read -r ip; do
+    if [ -z "$ip" ]; then
+      continue
+    fi
+    adb connect "$ip" && "$SCRCPY_PATH"/scrcpy --stay-awake --window-borderless --shortcut-mod=lctrl -s "$ip" &
+  done
+}
+main() {
+  if [ -z "$SCRCPY_PATH" ]; then
+    SCRCPY_PATH="$HOME/Documents/Apps/scrcpy-linux-x86_64-v4.0"
+  fi
+  local hosts
+
+  hosts="$(get_neighbors | find_tcpip_hosts || true)"
+
+  if [[ -z $hosts ]]; then
+    echo "No hosts found on tcpip 5555."
+    return 1
+  fi
+
+  printf '%s\n' "$hosts" |
+    choose_hosts |
+    open_mobile
+}
+main

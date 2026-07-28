@@ -3,6 +3,18 @@ res="$1"
 url="$2"
 subs_lang="$3"
 options=()
+show-help() {
+  echo "\
+  youtube playlist downloader Script 
+  Copyright (c) 2026 MaouNour. All Rights Reserved.
+  Usage:
+    ytpl <resolution> <url> <Subtitiles-Language> <yt-dlp options>
+  "
+}
+if [ "$#" -ne 1 ]; then
+  show-help
+  exit
+fi
 if [ -n "$subs_lang" ]; then
   options+=(
     --write-subs
@@ -11,4 +23,5 @@ if [ -n "$subs_lang" ]; then
     --sub-langs "$subs_lang"
   )
 fi
+options+=("${@:4}")
 yt-dlp -f "bestvideo[height<=$res][ext=mp4]+bestaudio/best[height<=$res][ext=m4a]" -o '%(playlist)s/%(playlist_index)s - %(title)s.%(ext)s' '--embed-chapters' "${options[@]}" "$url"
