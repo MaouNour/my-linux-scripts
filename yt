@@ -7,4 +7,12 @@ fi
 if [ -z "$res" ]; then
   res=$YT_DLP_DEFAULT_RES
 fi
-yt-dlp -f "bestvideo[height<=$res][ext=mp4]+bestaudio/best[height<=$res][ext=m4a]" "$url"
+show-help() {
+  echo "\
+  youtube Videos downloader Script 
+  Copyright (c) 2026 MaouNour. All Rights Reserved.
+  Usage:
+    ytpl <resolution> <url> <yt-dlp options>
+  "
+}
+yt-dlp -f "bestvideo[height<=$res][ext=mp4]+bestaudio/best[height<=$res][ext=m4a]" "${@:4}" "$url"

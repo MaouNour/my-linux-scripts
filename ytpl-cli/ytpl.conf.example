@@ -1,0 +1,35 @@
+#This should be located in ~/.config/ytpl/ytpl.conf
+
+################################################################################
+# ytpl options
+################################################################################
+
+resolution=720
+
+subs=en
+
+################################################################################
+# yt-dlp options
+################################################################################
+
+embed-chapters=true
+
+embed-thumbnail=true
+
+write-subs=true
+
+write-auto-subs=true
+
+embed-subs=true
+
+merge-output-format=mp4
+
+playlist-start=1
+
+playlist-end=10
+
+sleep-requests=1
+
+cookies=/home/nour/cookies.txt
+
+o=%(playlist)s/%(playlist_index)s - %(title)s.%(ext)s
