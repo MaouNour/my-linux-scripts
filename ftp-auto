@@ -34,7 +34,11 @@ open_hosts() {
   local ip
 
   while read -r ip; do
-    xdg-open "ftp://$ip:$FTP_PORT" &
+    if [ -z "$FTP_DEFAULT_APP" ]; then
+      xdg-open "ftp://$ip:$FTP_PORT" &
+    else
+      "$FTP_DEFAULT_APP" "ftp://$ip:$FTP_PORT" &
+    fi
   done
 }
 
@@ -47,9 +51,18 @@ main() {
     echo "No FTP hosts found."
     return 1
   fi
+  local next=false
+  for arg in "$@"; do
+    if [ "$next" = true ]; then
+      export FTP_DEFAULT_APP="$arg"
+    fi
+    if [ "$arg" = "--ftp-app" ]; then
+      next=true
+    fi
+  done
 
   printf '%s\n' "$ftp_hosts" |
     choose_hosts |
     open_hosts
 }
-main
+main "$@"
