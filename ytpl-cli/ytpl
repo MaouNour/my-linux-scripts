@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+################################################################################
+# Defaults
+################################################################################
+
+VERSION="1.0.0"
+
+resolution="720"
+subs=""
+url=""
+AUTO_CONFIG="$HOME/.config/ytpl/ytpl.conf"
+
+auto_load=false
+
+declare -A config
+declare -a ytdlp_opts=()
+
+################################################################################
+# Help
+################################################################################
+
+show_help() {
+  cat <<EOF
+ytpl - YouTube Playlist Downloader
+
+Usage:
+    ytpl [OPTIONS] URL
+
+Options
+
+    -r, --resolution NUM     Maximum resolution
+    -s, --subs LANG          Subtitle language
+
+    -h, --help               Show help
+    -v, --version            Show version
+
+Examples
+
+    ytpl URL
+
+    ytpl URL -r 1080
+
+    ytpl URL --subs en
+
+Backward compatibility
+
+    ytpl 720 URL
+
+    ytpl 720 URL en
+
+Everything unknown is passed directly to yt-dlp.
+
+EOF
+}
+
+################################################################################
+# Utils
+################################################################################
+
+is_number() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+is_url() {
+  [[ "$1" =~ ^https?:// ]]
+}
+is_true() {
+
+  case "${1,,}" in
+
+  true | yes | 1 | on)
+    return 0
+    ;;
+
+  *)
+    return 1
+    ;;
+
+  esac
+
+}
+################################################################################
+# Backward compatibility
+################################################################################
+
+legacy_mode() {
+
+  [[ $# -lt 2 ]] && return 1
+
+  is_number "$1" || return 1
+
+  is_url "$2" || return 1
+
+  resolution="$1"
+  url="$2"
+
+  shift 2
+
+  if [[ $# -gt 0 && "$1" != -* ]]; then
+    subs="$1"
+    shift
+  fi
+
+  ytdlp_opts+=("$@")
+
+  return 0
+}
+
+################################################################################
+# Parse CLI
+################################################################################
+
+parse_args() {
+
+  if legacy_mode "$@"; then
+    return
+  fi
+
+  while [[ $# -gt 0 ]]; do
+
+    case "$1" in
+
+    -r | --resolution)
+      resolution="$2"
+      shift 2
+      ;;
+
+    -s | --subs)
+      subs="$2"
+      shift 2
+      ;;
+
+    -h | --help)
+      show_help
+      exit 0
+      ;;
+
+    -v | --version)
+      echo "$VERSION"
+      exit 0
+      ;;
+    --config)
+
+      load_config "$2"
+      shift 2
+      ;;
+
+    --auto-load)
+
+      auto_load=true
+      shift
+      ;;
+    --)
+
+      shift
+      ytdlp_opts+=("$@")
+      break
+      ;;
+
+    -*)
+
+      ytdlp_opts+=("$1")
+
+      if [[ $# -gt 1 && "$2" != -* ]]; then
+        ytdlp_opts+=("$2")
+        shift
+      fi
+
+      shift
+      ;;
+
+    *)
+
+      if [[ -z "$url" ]]; then
+        url="$1"
+      else
+        ytdlp_opts+=("$1")
+      fi
+
+      shift
+      ;;
+
+    esac
+
+  done
+
+}
+load_config() {
+
+  local file="$1"
+
+  [[ -f "$file" ]] || return
+
+  while IFS='=' read -r key value; do
+
+    key="${key%%[[:space:]]*}"
+    value="${value#"${value%%[![:space:]]*}"}"
+
+    [[ -z "$key" ]] && continue
+    [[ "$key" =~ ^# ]] && continue
+
+    config["$key"]="$value"
+
+  done <"$file"
+
+}
+################################################################################
+# Build yt-dlp command
+################################################################################
+
+build_command() {
+
+  cmd=(
+    yt-dlp
+    -f
+    "bestvideo[height<=$resolution][ext=mp4]+bestaudio/best[height<=$resolution][ext=m4a]"
+    -o
+    "%(playlist)s/%(playlist_index)s - %(title)s.%(ext)s"
+    --embed-chapters
+  )
+
+  if [[ -n "$subs" ]]; then
+    cmd+=(
+      --write-subs
+      --write-auto-subs
+      --embed-subs
+      --sub-langs
+      "$subs"
+    )
+  fi
+
+  cmd+=("${ytdlp_opts[@]}")
+
+  cmd+=("$url")
+}
+
+apply_config() {
+
+  local key
+  local value
+
+  for key in "${!config[@]}"; do
+
+    value="${config[$key]}"
+
+    case "$key" in
+
+    resolution)
+
+      resolution="$value"
+      ;;
+
+    subs)
+
+      subs="$value"
+      ;;
+
+    auto-load)
+
+      is_true "$value" && auto_load=true
+      ;;
+
+    *)
+
+      if is_true "$value"; then
+
+        ytdlp_opts+=("--$key")
+
+      elif [[ "${value,,}" == false ]]; then
+
+        :
+
+      else
+
+        if [[ "$key" == "o" ]]; then
+          ytdlp_opts+=("-o" "$value")
+        else
+          ytdlp_opts+=("--$key" "$value")
+        fi
+
+      fi
+
+      ;;
+
+    esac
+
+  done
+
+}
+################################################################################
+# Main
+################################################################################
+
+main() {
+
+  parse_args "$@"
+
+  if $auto_load; then
+    load_config "$AUTO_CONFIG"
+  fi
+
+  apply_config
+
+  parse_args "$@"
+
+  if [[ -z "$url" ]]; then
+    echo "No URL supplied."
+    exit 1
+  fi
+
+  build_command
+
+  "${cmd[@]}"
+}
+
+main "$@"
