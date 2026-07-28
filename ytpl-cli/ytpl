@@ -6,10 +6,11 @@ set -Eeuo pipefail
 # Defaults
 ################################################################################
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
-declare -A cfg
-declare -A cli
+declare -A cfg=()
+declare -A cli=()
+declare -A config=()
 
 declare -a config_files=()
 declare -a ytdlp_opts=()
@@ -18,56 +19,65 @@ url=""
 AUTO_CONFIG="$HOME/.config/ytpl/ytpl.conf"
 
 auto_load=false
-
-declare -A config
-declare -a ytdlp_opts=()
+interactive_mode=false
 
 load_defaults() {
-
   cfg[resolution]=720
-
   cfg[subs]=""
-
   cfg[o]='%(playlist)s/%(playlist_index)s - %(title)s.%(ext)s'
-
-  cfg[embed - chapters]=true
-
+  cfg[embed-chapters]=true
 }
+
 ################################################################################
 # Help
 ################################################################################
 
 show_help() {
   cat <<EOF
-ytpl - YouTube Playlist Downloader
+ytpl - YouTube Playlist Downloader ($VERSION)
 
 Usage:
-    ytpl [OPTIONS] URL
+    ytpl [OPTIONS] URL [-- yt-dlp options]
 
 Options
-
-    -r, --resolution NUM     Maximum resolution
-    -s, --subs LANG          Subtitle language
-
-    -h, --help               Show help
-    -v, --version            Show version
+    -r, --resolution NUM     Maximum resolution (default: 720)
+    -s, --subs LANG          Subtitle language(s), e.g. en or en,fr
+    --config FILE            Load a config file (repeatable, later wins)
+    --auto-load              Also load ~/.config/ytpl/ytpl.conf
+    --cli                    Interactive mode: prompts for anything missing
+    -h, --help                Show help
+    -v, --version              Show version
 
 Examples
-
     ytpl URL
-
     ytpl URL -r 1080
+    ytpl -r 1080 URL --subs en
+    ytpl --cli
+    ytpl --auto-load URL
+    ytpl --config ~/.config/ytpl/work.conf URL
 
-    ytpl URL --subs en
-
-Backward compatibility
-
+Backward compatibility (still supported, order-strict)
     ytpl 720 URL
-
     ytpl 720 URL en
 
-Everything unknown is passed directly to yt-dlp.
+Order-flexible extras (works outside legacy mode too)
+    A bare number is treated as --resolution, a bare http(s) URL is
+    treated as the URL, regardless of where they appear.
 
+Config file format (~/.config/ytpl/ytpl.conf or --config FILE)
+    One "key=value" per line, '#' starts a comment. Keys map to yt-dlp
+    long options WITHOUT the leading dashes, e.g.:
+        resolution=1080
+        subs=en
+        embed-chapters=true
+        sub-langs=en,fr
+        o=%(title)s.%(ext)s
+    A key with value true/yes/1/on is passed as a bare flag (--key).
+    A key with value false/no/0/off is omitted entirely.
+    Anything else is passed as --key value.
+
+Everything after "--", or any unrecognized flag, is forwarded straight
+to yt-dlp.
 EOF
 }
 
@@ -82,45 +92,48 @@ is_number() {
 is_url() {
   [[ "$1" =~ ^https?:// ]]
 }
+
 is_true() {
-
   case "${1,,}" in
-
   true | yes | 1 | on)
     return 0
     ;;
-
   *)
     return 1
     ;;
-
   esac
-
 }
+
+is_false() {
+  case "${1,,}" in
+  false | no | 0 | off)
+    return 0
+    ;;
+  *)
+    return 1
+    ;;
+  esac
+}
+
 ################################################################################
 # Backward compatibility
 ################################################################################
 
 legacy_mode() {
-
   [[ $# -lt 2 ]] && return 1
-
   is_number "$1" || return 1
-
   is_url "$2" || return 1
 
-  resolution="$1"
+  cli[resolution]="$1"
   url="$2"
-
   shift 2
 
   if [[ $# -gt 0 && "$1" != -* ]]; then
-    subs="$1"
+    cli[subs]="$1"
     shift
   fi
 
   ytdlp_opts+=("$@")
-
   return 0
 }
 
@@ -129,13 +142,11 @@ legacy_mode() {
 ################################################################################
 
 parse_args() {
-
   if legacy_mode "$@"; then
     return
   fi
 
   while [[ $# -gt 0 ]]; do
-
     case "$1" in
 
     -r | --resolution)
@@ -157,106 +168,172 @@ parse_args() {
       echo "$VERSION"
       exit 0
       ;;
-    --config)
 
+    --config)
       config_files+=("$2")
       shift 2
       ;;
 
     --auto-load)
-
-      cli[auto - load]=true
+      auto_load=true
       shift
       ;;
+
     --cli)
-
-      cli[cli]=true
-
+      interactive_mode=true
       shift
       ;;
-    --)
 
+    --)
       shift
       ytdlp_opts+=("$@")
       break
       ;;
 
     -*)
-
       ytdlp_opts+=("$1")
-
       if [[ $# -gt 1 && "$2" != -* ]]; then
         ytdlp_opts+=("$2")
         shift
       fi
-
       shift
       ;;
 
     *)
-
-      if [[ -z "$url" ]]; then
+      # Order-flexible extras: a bare number is a resolution, a bare
+      # URL is the URL, no matter where they show up.
+      if is_number "$1" && [[ -z "${cli[resolution]:-}" ]]; then
+        cli[resolution]="$1"
+      elif is_url "$1" && [[ -z "$url" ]]; then
+        url="$1"
+      elif [[ -z "$url" ]]; then
         url="$1"
       else
         ytdlp_opts+=("$1")
       fi
-
       shift
       ;;
 
     esac
-
   done
-
 }
+
+################################################################################
+# Config file handling
+################################################################################
+
 load_config() {
-
   local file="$1"
+  [[ -f "$file" ]] || return 0
 
-  [[ -f "$file" ]] || return
-
-  while IFS='=' read -r key value; do
-
+  local key value
+  while IFS='=' read -r key value || [[ -n "$key" ]]; do
     key="${key%%[[:space:]]*}"
-    value="${value#"${value%%[![:space:]]*}"}"
-
     [[ -z "$key" ]] && continue
     [[ "$key" =~ ^# ]] && continue
 
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+
     config["$key"]="$value"
-
   done <"$file"
-
 }
-load_all_configs() {
 
-  if is_true "${cli[auto - load]:-false}"; then
+load_all_configs() {
+  if $auto_load; then
     load_config "$AUTO_CONFIG"
   fi
 
   local file
-
-  for file in "${config_files[@]}"; do
-    load_config "$file"
+  for file in "${config_files[@]:-}"; do
+    if [[ -n "$file" ]]; then
+      load_config "$file"
+    fi
   done
-
+  return 0
 }
+
+# Apply the loaded config file(s) on top of defaults (lowest precedence
+# after defaults; CLI flags override this later in apply_cli).
+apply_config() {
+  local key value
+
+  for key in "${!config[@]}"; do
+    value="${config[$key]}"
+
+    case "$key" in
+    resolution) cfg[resolution]="$value" ;;
+    subs) cfg[subs]="$value" ;;
+    o) cfg[o]="$value" ;;
+    embed-chapters) cfg[embed-chapters]="$value" ;;
+    auto-load) : ;; # informational only, loading already decided by CLI
+    cli) is_true "$value" && interactive_mode=true ;;
+    *)
+      if is_true "$value"; then
+        ytdlp_opts+=("--$key")
+      elif is_false "$value"; then
+        :
+      else
+        ytdlp_opts+=("--$key" "$value")
+      fi
+      ;;
+    esac
+  done
+}
+
+# Apply CLI-parsed values on top of cfg (highest precedence).
+apply_cli() {
+  local key
+  for key in "${!cli[@]}"; do
+    cfg["$key"]="${cli[$key]}"
+  done
+}
+
+################################################################################
+# Interactive mode
+################################################################################
+
+run_interactive() {
+  local ans
+
+  if [[ -z "${cli[resolution]:-}" ]]; then
+    read -rp "Max resolution [${cfg[resolution]}]: " ans
+    [[ -n "$ans" ]] && cfg[resolution]="$ans"
+  fi
+
+  if [[ -z "${cli[subs]:-}" ]]; then
+    read -rp "Subtitle language (blank for none) [${cfg[subs]}]: " ans
+    [[ -n "$ans" ]] && cfg[subs]="$ans"
+  fi
+
+  while [[ -z "$url" ]]; do
+    read -rp "Playlist URL: " ans
+    if is_url "$ans"; then
+      url="$ans"
+    else
+      echo "Please enter a valid http(s) URL." >&2
+    fi
+  done
+}
+
 ################################################################################
 # Build yt-dlp command
 ################################################################################
 
 build_command() {
-
   cmd=(
     yt-dlp
     -f
     "bestvideo[height<=${cfg[resolution]}][ext=mp4]+bestaudio/best[height<=${cfg[resolution]}][ext=m4a]"
     -o
     "${cfg[o]}"
-    --embed-chapters
   )
 
-  if [[ -n "${cfg[subs]}" ]]; then
+  if is_true "${cfg[embed-chapters]:-true}"; then
+    cmd+=(--embed-chapters)
+  fi
+
+  if [[ -n "${cfg[subs]:-}" ]]; then
     cmd+=(
       --write-subs
       --write-auto-subs
@@ -267,97 +344,33 @@ build_command() {
   fi
 
   cmd+=("${ytdlp_opts[@]}")
-
   cmd+=("$url")
 }
 
-apply_config() {
-
-  local key
-  local value
-
-  for key in "${!config[@]}"; do
-
-    value="${config[$key]}"
-
-    case "$key" in
-
-    resolution)
-
-      resolution="$value"
-      ;;
-
-    subs)
-
-      subs="$value"
-      ;;
-
-    auto-load)
-
-      is_true "$value" && auto_load=true
-      ;;
-
-    *)
-
-      if is_true "$value"; then
-
-        ytdlp_opts+=("--$key")
-
-      elif [[ "${value,,}" == false ]]; then
-
-        :
-
-      else
-
-        if [[ "$key" == "o" ]]; then
-          ytdlp_opts+=("-o" "$value")
-        else
-          ytdlp_opts+=("--$key" "$value")
-        fi
-
-      fi
-
-      ;;
-
-    esac
-
-  done
-
-}
-apply_cli() {
-
-  local key
-
-  for key in "${!cli[@]}"; do
-
-    cfg["$key"]="${cli[$key]}"
-
-  done
-
-}
 ################################################################################
 # Main
 ################################################################################
 
 main() {
+  load_defaults
 
   parse_args "$@"
 
-  if $auto_load; then
-    load_config "$AUTO_CONFIG"
+  load_all_configs
+  apply_config
+  apply_cli
+
+  if $interactive_mode; then
+    run_interactive
   fi
 
-  apply_config
-
-  parse_args "$@"
-
   if [[ -z "$url" ]]; then
-    echo "No URL supplied."
+    echo "No URL supplied." >&2
+    show_help
     exit 1
   fi
 
   build_command
-
   "${cmd[@]}"
 }
 
