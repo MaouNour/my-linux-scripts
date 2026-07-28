@@ -7,7 +7,6 @@ import queue
 import sys
 import time
 import shutil
-import json
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 from pydbus import SessionBus
@@ -20,14 +19,19 @@ AUDIO_EXTS = {".mp3", ".m4a", ".flac", ".ogg", ".wav", ".opus"}
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv"}
 SUPPORTED_EXTS = AUDIO_EXTS | VIDEO_EXTS
 
-# --- Loudness normalization (EBU R128 via ffmpeg's loudnorm filter) ---
-LOUDNESS_TARGET_LUFS = -16.0   # typical target for personal music playback
-LOUDNESS_MAX_BOOST_DB = 12.0   # never boost a quiet/silent file more than this
-LOUDNESS_MAX_CUT_DB = 15.0     # never cut an already-loud file more than this
+# --- Loudness normalization ---
+# mplay never analyzes anything itself. `mindex loudness analyze` measures
+# each track once with ffmpeg and caches the result in the tracks table;
+# mplay just reads that cached value and applies a gain. Keep these constants
+# in sync with mindex.
+LOUDNESS_TARGET_LUFS = -16.0
+LOUDNESS_MAX_BOOST_DB = 12.0
+LOUDNESS_MAX_CUT_DB = 15.0
 
 # --- Globals ---
 playlist = []
 playlist_ids = []  # Track database IDs for currently playing playlist
+playlist_lufs = []  # Cached loudness (LUFS) per track, from the DB; None = not analyzed
 index = 0
 paused = False
 proc = None
@@ -57,6 +61,13 @@ def get_connection():
     return conn
 
 
+def _has_loudness_column(conn):
+    c = conn.cursor()
+    c.execute("PRAGMA table_info(tracks)")
+    cols = {row[1] for row in c.fetchall()}
+    return "loudness_lufs" in cols
+
+
 def get_playlist_tracks(playlist_name):
     conn = get_connection()
     c = conn.cursor()
@@ -65,11 +76,13 @@ def get_playlist_tracks(playlist_name):
     if not row:
         print(f"❌ Playlist '{playlist_name}' does not exist.")
         conn.close()
-        return [], []
+        return [], [], []
     playlist_id = row[0]
+    has_lufs = _has_loudness_column(conn)
+    lufs_col = "t.loudness_lufs" if has_lufs else "NULL"
     c.execute(
-        """
-        SELECT t.id, t.path
+        f"""
+        SELECT t.id, t.path, {lufs_col}
         FROM tracks t
         JOIN playlist_tracks pt ON t.id = pt.track_id
         WHERE pt.playlist_id = ?
@@ -83,7 +96,8 @@ def get_playlist_tracks(playlist_name):
         print(f"⚠️ Playlist '{playlist_name}' is empty.")
     ids = [r[0] for r in rows]
     paths = [r[1] for r in rows]
-    return paths, ids
+    lufs = [r[2] for r in rows]
+    return paths, ids, lufs
 
 
 def add_current_to_playlist(current_id, playlist_name):
@@ -154,107 +168,14 @@ def get_track_length(path):
 
 
 # --- Loudness normalization ---
-def init_loudness_table():
-    conn = get_connection()
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS loudness_cache (
-            path TEXT PRIMARY KEY,
-            mtime REAL NOT NULL,
-            integrated_lufs REAL NOT NULL
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
-
-
-def _cached_loudness(path, mtime):
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute(
-        "SELECT integrated_lufs FROM loudness_cache WHERE path = ? AND mtime = ?",
-        (path, mtime),
-    )
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-
-def _store_loudness(path, mtime, lufs):
-    conn = get_connection()
-    conn.execute(
-        "INSERT OR REPLACE INTO loudness_cache (path, mtime, integrated_lufs) VALUES (?, ?, ?)",
-        (path, mtime, lufs),
-    )
-    conn.commit()
-    conn.close()
-
-
-def measure_loudness(path):
-    """Single-pass ffmpeg loudnorm analysis. Returns integrated LUFS, or None on failure."""
-    if not shutil.which("ffmpeg"):
-        return None
-    try:
-        result = subprocess.run(
-            [
-                "ffmpeg", "-hide_banner", "-nostats", "-i", path,
-                "-vn", "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
-                "-f", "null", "-",
-            ],
-            capture_output=True, text=True, timeout=180,
-        )
-        stderr = result.stderr
-        start = stderr.rfind("{")
-        end = stderr.rfind("}")
-        if start == -1 or end == -1 or end < start:
-            return None
-        data = json.loads(stderr[start:end + 1])
-        return float(data["input_i"])
-    except Exception as e:
-        print(f"⚠️ Loudness analysis failed for {Path(path).name}: {e}")
-        return None
-
-
-def get_loudness_gain_db(path):
-    """dB gain to bring `path` to LOUDNESS_TARGET_LUFS. Measures + caches on first use."""
-    try:
-        mtime = Path(path).stat().st_mtime
-    except OSError:
-        return 0.0
-
-    lufs = _cached_loudness(path, mtime)
+# mplay does no analysis of its own — it just converts whatever LUFS value
+# was cached by `mindex loudness analyze` into a playback gain. If a track
+# hasn't been analyzed yet, this simply returns 0.0 (no adjustment).
+def compute_gain_db(lufs):
     if lufs is None:
-        print(f"🔍 Analyzing loudness (first play): {Path(path).name}")
-        lufs = measure_loudness(path)
-        if lufs is None:
-            return 0.0
-        _store_loudness(path, mtime, lufs)
-
+        return 0.0
     gain = LOUDNESS_TARGET_LUFS - lufs
     return max(-LOUDNESS_MAX_CUT_DB, min(LOUDNESS_MAX_BOOST_DB, gain))
-
-
-def prewarm_loudness_cache():
-    """Background pass that measures every not-yet-cached track in the current
-    playlist (starting from the current song), so later plays are instant."""
-    with _lock:
-        order = list(range(index, len(playlist))) + list(range(0, index))
-        snapshot = list(playlist)
-    for i in order:
-        if i >= len(snapshot):
-            continue
-        path = snapshot[i]
-        try:
-            mtime = Path(path).stat().st_mtime
-        except OSError:
-            continue
-        if _cached_loudness(path, mtime) is not None:
-            continue
-        lufs = measure_loudness(path)
-        if lufs is not None:
-            _store_loudness(path, mtime, lufs)
-        time.sleep(0.2)  # be polite to CPU/disk while music is actively playing
 
 
 # --- Player controls ---
@@ -267,17 +188,20 @@ def play_song(start_offset=0.0):
             print("⚠️ Playlist is empty.")
             return
         path = playlist[index]
+        lufs = playlist_lufs[index] if index < len(playlist_lufs) else None
         this_index = index
 
-    # ffprobe (length) and loudnorm analysis (gain) can take a while on a
-    # track's first play. Do them without holding _lock so next/prev/pause
-    # etc. never block behind an analysis run.
+    # ffprobe (length) can take a moment on a track's first play; do it
+    # without holding _lock so next/prev/pause etc. never block behind it.
+    # The loudness gain itself is just arithmetic on a value already loaded
+    # from the DB, so it costs nothing to compute here.
     length = get_track_length(path)
-    gain_db = get_loudness_gain_db(path)
+    gain_db = compute_gain_db(lufs)
 
     with _lock:
-        # If the selection changed while we were analyzing (e.g. the user
-        # hit Next mid-analysis), bail out rather than playing a stale track.
+        # If the selection changed while we were probing length (e.g. the
+        # user hit Next in the meantime), bail out rather than playing a
+        # stale track.
         if not playlist or index != this_index or playlist[index] != path:
             return
 
@@ -473,7 +397,7 @@ def advance_track():
 
 def open_uri(uri):
     """MPRIS OpenUri: add a file (path or file:// URI) to the playlist and play it."""
-    global playlist, playlist_ids, index
+    global playlist, playlist_ids, playlist_lufs, index
     with _lock:
         path = uri
         if uri.startswith("file://"):
@@ -481,8 +405,25 @@ def open_uri(uri):
         if not Path(path).exists():
             print(f"⚠️ File not found: {path}")
             return
+
+        # If this file happens to already be indexed and analyzed, reuse its
+        # cached loudness instead of treating it as unanalyzed.
+        lufs = None
+        try:
+            conn = get_connection()
+            if _has_loudness_column(conn):
+                c = conn.cursor()
+                c.execute("SELECT loudness_lufs FROM tracks WHERE path = ?", (path,))
+                row = c.fetchone()
+                if row:
+                    lufs = row[0]
+            conn.close()
+        except Exception:
+            pass
+
         playlist.append(path)
         playlist_ids.append(None)
+        playlist_lufs.append(lufs)
         index = len(playlist) - 1
         play_song()
 
@@ -730,7 +671,7 @@ def interactive_loop():
     global index
     while True:
         cmd = input(
-            "Command (add <playlist>, remove <playlist>, next, prev, pause, play, quit): "
+            "Command (add <playlist>, remove <playlist>, next, prev, pause, play, loudness, quit): "
         ).strip()
         current_id = playlist_ids[index] if playlist_ids else None
         if cmd.startswith("add ") and current_id:
@@ -745,6 +686,20 @@ def interactive_loop():
             pause_song()
         elif cmd == "play":
             resume_song()
+        elif cmd == "loudness":
+            # Purely informational: reads whatever is already loaded in
+            # memory (from the DB at playlist-load time). Never analyzes.
+            if not playlist:
+                print("⚠️ Nothing loaded.")
+            else:
+                lufs = playlist_lufs[index] if index < len(playlist_lufs) else None
+                gain = compute_gain_db(lufs)
+                name = Path(playlist[index]).name
+                if lufs is None:
+                    print(f"🔊 {name}: not analyzed yet — run `mindex loudness analyze`")
+                else:
+                    sign = "+" if gain >= 0 else ""
+                    print(f"🔊 {name}: {lufs:.2f} LUFS, applying {sign}{gain:.2f} dB")
         elif cmd == "quit":
             stop_song()
             print("👋 Exiting player.")
@@ -755,33 +710,44 @@ def interactive_loop():
 
 # --- Main ---
 def main():
-    global playlist, playlist_ids, index
-
-    init_loudness_table()
+    global playlist, playlist_ids, playlist_lufs, index
 
     if len(sys.argv) > 1 and sys.argv[1] != "--all":
         playlist_name = sys.argv[1]
         print(f"📂 Loading playlist: {playlist_name}")
-        playlist, playlist_ids = get_playlist_tracks(playlist_name)
+        playlist, playlist_ids, playlist_lufs = get_playlist_tracks(playlist_name)
         if not playlist:
             sys.exit(1)
     else:
         conn = get_connection()
+        has_lufs = _has_loudness_column(conn)
         c = conn.cursor()
-        c.execute("SELECT id, path FROM tracks")
-        rows = c.fetchall()
+        if has_lufs:
+            c.execute("SELECT id, path, loudness_lufs FROM tracks")
+            rows = c.fetchall()
+            playlist_ids = [r[0] for r in rows]
+            playlist = [r[1] for r in rows]
+            playlist_lufs = [r[2] for r in rows]
+        else:
+            c.execute("SELECT id, path FROM tracks")
+            rows = c.fetchall()
+            playlist_ids = [r[0] for r in rows]
+            playlist = [r[1] for r in rows]
+            playlist_lufs = [None] * len(rows)
         conn.close()
-        playlist_ids = [r[0] for r in rows]
-        playlist = [r[1] for r in rows]
         print(f"📂 Loaded {len(playlist)} tracks from library")
 
-    random.shuffle(playlist)
+    # Shuffle path/id/loudness together as a unit — shuffling `playlist`
+    # alone would desync it from playlist_ids/playlist_lufs.
+    combined = list(zip(playlist, playlist_ids, playlist_lufs))
+    random.shuffle(combined)
+    if combined:
+        playlist, playlist_ids, playlist_lufs = (list(x) for x in zip(*combined))
+    else:
+        playlist, playlist_ids, playlist_lufs = [], [], []
+
     index = 0
     play_song()
-
-    # Quietly pre-analyze the rest of the library's loudness in the background
-    # so future plays don't pay the first-time analysis cost.
-    threading.Thread(target=prewarm_loudness_cache, daemon=True).start()
 
     # Start CLI in a background thread
     threading.Thread(target=interactive_loop, daemon=True).start()

@@ -2,6 +2,9 @@
 import os
 import sys
 import sqlite3
+import subprocess
+import shutil
+import json
 from pathlib import Path
 import re
 
@@ -17,6 +20,12 @@ DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 AUDIO_EXTS = {".mp3", ".m4a", ".flac", ".ogg", ".wav", ".opus"}
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv"}
 SUPPORTED_EXTS = AUDIO_EXTS | VIDEO_EXTS
+
+# --- Loudness normalization (EBU R128 via ffmpeg's loudnorm filter) ---
+# Keep these in sync with mplay, which reads the cached values these produce.
+LOUDNESS_TARGET_LUFS = -16.0
+LOUDNESS_MAX_BOOST_DB = 12.0
+LOUDNESS_MAX_CUT_DB = 15.0
 
 
 # --- Database Helpers ---
@@ -60,8 +69,21 @@ def init_db():
     )
     """)
 
+    _migrate_loudness_columns(conn)
+
     conn.commit()
     return conn, c
+
+
+def _migrate_loudness_columns(conn):
+    """Add loudness columns to an existing tracks table if they're missing."""
+    c = conn.cursor()
+    c.execute("PRAGMA table_info(tracks)")
+    cols = {row[1] for row in c.fetchall()}
+    if "loudness_lufs" not in cols:
+        c.execute("ALTER TABLE tracks ADD COLUMN loudness_lufs REAL")
+    if "loudness_mtime" not in cols:
+        c.execute("ALTER TABLE tracks ADD COLUMN loudness_mtime REAL")
 
 
 # --- Library Helpers ---
@@ -330,6 +352,191 @@ def list_playlist(name):
         print(f"{tid:4d} | {fname} | {path}")
 
 
+# --- Loudness ---
+def gain_for_lufs(lufs):
+    """dB gain that would bring a track measured at `lufs` to LOUDNESS_TARGET_LUFS."""
+    if lufs is None:
+        return None
+    gain = LOUDNESS_TARGET_LUFS - lufs
+    return max(-LOUDNESS_MAX_CUT_DB, min(LOUDNESS_MAX_BOOST_DB, gain))
+
+
+def measure_loudness(path):
+    """Single-pass ffmpeg loudnorm analysis. Returns integrated LUFS, or None on failure."""
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-nostats", "-i", path,
+                "-vn", "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
+                "-f", "null", "-",
+            ],
+            capture_output=True, text=True, timeout=180,
+        )
+        stderr = result.stderr
+        start = stderr.rfind("{")
+        end = stderr.rfind("}")
+        if start == -1 or end == -1 or end < start:
+            return None
+        data = json.loads(stderr[start:end + 1])
+        return float(data["input_i"])
+    except Exception as e:
+        print(f"⚠️ Loudness analysis failed for {Path(path).name}: {e}")
+        return None
+
+
+def analyze_loudness(folder_filter=None, force=False, limit=None):
+    """Measure and cache integrated loudness for tracks in the DB.
+
+    Skips tracks that are already analyzed and unchanged on disk, unless
+    --force is given. This is the only place that runs ffmpeg — mplay just
+    reads whatever is cached here.
+    """
+    if not shutil.which("ffmpeg"):
+        print("❌ ffmpeg not found in PATH; cannot analyze loudness.")
+        return
+    if not DB_PATH.exists():
+        print("❌ Database not found. Run scan first.")
+        return
+
+    conn = get_connection()
+    _migrate_loudness_columns(conn)
+    conn.commit()
+    c = conn.cursor()
+
+    query = "SELECT id, path, loudness_lufs, loudness_mtime FROM tracks WHERE 1=1"
+    params = []
+    if folder_filter:
+        folder_path = str(Path(folder_filter).expanduser().resolve())
+        if not folder_path.endswith(os.sep):
+            folder_path += os.sep
+        query += " AND path LIKE ?"
+        params.append(f"{folder_path}%")
+    query += " ORDER BY id ASC"
+    c.execute(query, params)
+    rows = c.fetchall()
+
+    analyzed = 0
+    skipped = 0
+    missing = 0
+
+    for track_id, path, existing_lufs, existing_mtime in rows:
+        if limit is not None and analyzed >= limit:
+            break
+
+        p = Path(path)
+        if not p.exists():
+            missing += 1
+            continue
+
+        mtime = p.stat().st_mtime
+        if not force and existing_lufs is not None and existing_mtime == mtime:
+            skipped += 1
+            continue
+
+        print(f"🔍 Analyzing [{track_id}]: {p.name}")
+        lufs = measure_loudness(path)
+        if lufs is None:
+            continue
+
+        c.execute(
+            "UPDATE tracks SET loudness_lufs = ?, loudness_mtime = ? WHERE id = ?",
+            (lufs, mtime, track_id),
+        )
+        conn.commit()
+        analyzed += 1
+
+    conn.close()
+    print(
+        f"✅ Loudness analysis complete. "
+        f"Analyzed {analyzed}, skipped {skipped} (already up to date), {missing} missing on disk."
+    )
+
+
+def list_loudness(folder_filter=None, search=None, sort_by="id", only_missing=False):
+    if not DB_PATH.exists():
+        print("❌ Database not found. Run scan first.")
+        return
+
+    conn = get_connection()
+    _migrate_loudness_columns(conn)
+    conn.commit()
+    c = conn.cursor()
+
+    query = "SELECT id, filename, loudness_lufs FROM tracks WHERE 1=1"
+    params = []
+    if folder_filter:
+        folder_path = str(Path(folder_filter).expanduser().resolve())
+        if not folder_path.endswith(os.sep):
+            folder_path += os.sep
+        query += " AND path LIKE ?"
+        params.append(f"{folder_path}%")
+    if search:
+        query += " AND LOWER(filename) LIKE ?"
+        params.append(f"%{search.lower()}%")
+    if only_missing:
+        query += " AND loudness_lufs IS NULL"
+    c.execute(query, params)
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        print("⚠️ No tracks match your criteria.")
+        return
+
+    items = [(tid, fname, lufs, gain_for_lufs(lufs)) for tid, fname, lufs in rows]
+
+    if sort_by == "lufs":
+        items.sort(key=lambda x: (x[2] is None, x[2]))
+    elif sort_by == "gain":
+        items.sort(key=lambda x: (x[3] is None, x[3]))
+    elif sort_by == "filename":
+        items.sort(key=lambda x: x[1].lower())
+    # "id" (default) keeps the query's ORDER BY id order
+
+    print(f"🔊 Loudness for {len(items)} track(s):\n")
+    for track_id, filename, lufs, gain in items:
+        name = filename if len(filename) <= 58 else filename[:55] + "..."
+        if lufs is None:
+            print(f"{track_id:4d} | {name:<58} | not analyzed")
+        else:
+            sign = "+" if gain >= 0 else ""
+            print(f"{track_id:4d} | {name:<58} | {lufs:7.2f} LUFS | gain {sign}{gain:.2f} dB")
+
+
+def show_loudness(track_id):
+    if not DB_PATH.exists():
+        print("❌ Database not found. Run scan first.")
+        return
+
+    conn = get_connection()
+    _migrate_loudness_columns(conn)
+    conn.commit()
+    c = conn.cursor()
+    c.execute(
+        "SELECT filename, path, loudness_lufs, loudness_mtime FROM tracks WHERE id = ?",
+        (track_id,),
+    )
+    row = c.fetchone()
+    conn.close()
+
+    if not row:
+        print(f"❌ No track with id {track_id}")
+        return
+
+    filename, path, lufs, mtime = row
+    print(f"🎵 {filename}")
+    print(f"    path: {path}")
+    if lufs is None:
+        print("    loudness: not analyzed yet (run `mindex loudness analyze`)")
+    else:
+        gain = gain_for_lufs(lufs)
+        sign = "+" if gain >= 0 else ""
+        print(
+            f"    loudness: {lufs:.2f} LUFS  →  playback gain {sign}{gain:.2f} dB "
+            f"(target {LOUDNESS_TARGET_LUFS} LUFS)"
+        )
+
+
 # --- CLI Interface ---
 def main():
     if len(sys.argv) < 2:
@@ -350,6 +557,13 @@ def main():
             "  mindex playlist add <name> [--id=1,2] [--filename=a.mp3,b.m4a] [--regex=<pat>]"
         )
         print("  mindex playlist list [<name>]")
+        print(
+            "  mindex loudness analyze [folder] [--force] [--limit=N]  → measure & cache loudness"
+        )
+        print(
+            "  mindex loudness list [folder] [--search=kw] [--sort=id|lufs|gain|filename] [--missing]"
+        )
+        print("  mindex loudness show <id>          → detail for one track")
         sys.exit(0)
 
     cmd = sys.argv[1].lower()
@@ -440,6 +654,44 @@ def main():
             )
         else:
             print("❌ Unknown playlist command or missing name.")
+    elif cmd == "loudness":
+        if len(sys.argv) < 3:
+            print("❌ Loudness command requires subcommand: analyze | list | show")
+            sys.exit(0)
+        sub = sys.argv[2].lower()
+        if sub == "analyze":
+            folder_filter = None
+            force = False
+            limit = None
+            for arg in sys.argv[3:]:
+                if arg == "--force":
+                    force = True
+                elif arg.startswith("--limit="):
+                    limit = int(arg.replace("--limit=", ""))
+                else:
+                    folder_filter = arg
+            analyze_loudness(folder_filter=folder_filter, force=force, limit=limit)
+        elif sub == "list":
+            folder_filter = None
+            search = None
+            sort_by = "id"
+            only_missing = False
+            for arg in sys.argv[3:]:
+                if arg.startswith("--search="):
+                    search = arg.replace("--search=", "")
+                elif arg.startswith("--sort="):
+                    sort_by = arg.replace("--sort=", "")
+                elif arg == "--missing":
+                    only_missing = True
+                else:
+                    folder_filter = arg
+            list_loudness(
+                folder_filter=folder_filter, search=search, sort_by=sort_by, only_missing=only_missing
+            )
+        elif sub == "show" and len(sys.argv) > 3:
+            show_loudness(int(sys.argv[3]))
+        else:
+            print("❌ Unknown loudness command or missing id.")
     else:
         print("❌ Unknown command.")
 
