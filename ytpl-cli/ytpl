@@ -8,8 +8,12 @@ set -Eeuo pipefail
 
 VERSION="1.0.0"
 
-resolution="720"
-subs=""
+declare -A cfg
+declare -A cli
+
+declare -a config_files=()
+declare -a ytdlp_opts=()
+
 url=""
 AUTO_CONFIG="$HOME/.config/ytpl/ytpl.conf"
 
@@ -18,6 +22,17 @@ auto_load=false
 declare -A config
 declare -a ytdlp_opts=()
 
+load_defaults() {
+
+  cfg[resolution]=720
+
+  cfg[subs]=""
+
+  cfg[o]='%(playlist)s/%(playlist_index)s - %(title)s.%(ext)s'
+
+  cfg[embed - chapters]=true
+
+}
 ################################################################################
 # Help
 ################################################################################
@@ -124,12 +139,12 @@ parse_args() {
     case "$1" in
 
     -r | --resolution)
-      resolution="$2"
+      cli[resolution]="$2"
       shift 2
       ;;
 
     -s | --subs)
-      subs="$2"
+      cli[subs]="$2"
       shift 2
       ;;
 
@@ -144,13 +159,19 @@ parse_args() {
       ;;
     --config)
 
-      load_config "$2"
+      config_files+=("$2")
       shift 2
       ;;
 
     --auto-load)
 
-      auto_load=true
+      cli[auto - load]=true
+      shift
+      ;;
+    --cli)
+
+      cli[cli]=true
+
       shift
       ;;
     --)
@@ -207,6 +228,19 @@ load_config() {
   done <"$file"
 
 }
+load_all_configs() {
+
+  if is_true "${cli[auto - load]:-false}"; then
+    load_config "$AUTO_CONFIG"
+  fi
+
+  local file
+
+  for file in "${config_files[@]}"; do
+    load_config "$file"
+  done
+
+}
 ################################################################################
 # Build yt-dlp command
 ################################################################################
@@ -216,19 +250,19 @@ build_command() {
   cmd=(
     yt-dlp
     -f
-    "bestvideo[height<=$resolution][ext=mp4]+bestaudio/best[height<=$resolution][ext=m4a]"
+    "bestvideo[height<=${cfg[resolution]}][ext=mp4]+bestaudio/best[height<=${cfg[resolution]}][ext=m4a]"
     -o
-    "%(playlist)s/%(playlist_index)s - %(title)s.%(ext)s"
+    "${cfg[o]}"
     --embed-chapters
   )
 
-  if [[ -n "$subs" ]]; then
+  if [[ -n "${cfg[subs]}" ]]; then
     cmd+=(
       --write-subs
       --write-auto-subs
       --embed-subs
       --sub-langs
-      "$subs"
+      "${cfg[subs]}"
     )
   fi
 
@@ -286,6 +320,17 @@ apply_config() {
       ;;
 
     esac
+
+  done
+
+}
+apply_cli() {
+
+  local key
+
+  for key in "${!cli[@]}"; do
+
+    cfg["$key"]="${cli[$key]}"
 
   done
 
