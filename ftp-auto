@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-set -euo pipefail
+#set -euo pipefail
 
 FTP_PORT=2121
 
@@ -37,7 +37,7 @@ open_hosts() {
     if [ -z "$FTP_DEFAULT_APP" ]; then
       xdg-open "ftp://$ip:$FTP_PORT" &
     else
-      "$FTP_DEFAULT_APP" "ftp://$ip:$FTP_PORT" &
+      "$FTP_DEFAULT_APP" "ftp://$ip:$FTP_PORT" &>/dev/null &
     fi
   done
 }

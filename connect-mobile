@@ -30,7 +30,8 @@ open_mobile() {
     if [ -z "$ip" ]; then
       continue
     fi
-    adb connect "$ip" && "$SCRCPY_PATH"/scrcpy --stay-awake --window-borderless --shortcut-mod=lctrl -s "$ip" &
+    adb connect "$ip" &>/dev/null &&
+      "$SCRCPY_PATH"/scrcpy --stay-awake --window-borderless --shortcut-mod=lctrl -s "$ip" &>/dev/null &
   done
 }
 main() {
