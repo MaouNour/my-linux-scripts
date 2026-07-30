@@ -1,0 +1,9 @@
+#!/bin/bash
+catigory="$1"
+app="$2"
+DIR="$HOME/.local/share/default-app/bin"
+mkdir -p "$DIR"
+touch "$DIR/$catigory"
+chmod +x "$DIR/$catigory"
+echo "#!/bin/bash 
+$app "'"$@"' >"$DIR/$catigory"
