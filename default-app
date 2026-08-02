@@ -2,6 +2,11 @@
 catigory="$1"
 app="$2"
 DIR="$HOME/.local/share/default-app/bin"
+INBASHRC="echo $PATH | grep $DIR"
+if [ -z "$INBASHRC" ]; then
+  echo "export PATH="'$PATH:'"$DIR" >>"$HOME/.bashrc"
+  source "$HOME/.bashrc"
+fi
 mkdir -p "$DIR"
 touch "$DIR/$catigory"
 chmod +x "$DIR/$catigory"

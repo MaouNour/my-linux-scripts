@@ -1,0 +1,21 @@
+#!/bin/bash
+
+RULE_FILE="/etc/udev/rules.d/72-ds4tm.rules"
+
+# Check if the rule file exists and is active
+if [ -f "$RULE_FILE" ] && grep -q "LIBINPUT_IGNORE_DEVICE" "$RULE_FILE"; then
+  echo "🔴 Enabling PS4 Touchpad..."
+  # Remove or comment out the rules to enable the device
+  sudo rm "$RULE_FILE"
+else
+  echo "🟢 Disabling PS4 Touchpad..."
+  # Create the rules to disable the device
+  echo 'ATTRS{name}=="Sony Interactive Entertainment Wireless Controller Touchpad", ENV{LIBINPUT_IGNORE_DEVICE}="1"' | sudo tee "$RULE_FILE" >/dev/null
+  echo 'ATTRS{name}=="Wireless Controller Touchpad", ENV{LIBINPUT_IGNORE_DEVICE}="1"' | sudo tee -a "$RULE_FILE" >/dev/null
+fi
+
+# Reload rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+
+echo "Done. Please **reconnect** your controller for changes to apply."

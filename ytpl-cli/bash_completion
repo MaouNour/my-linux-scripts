@@ -1,0 +1,54 @@
+# bash completion for ytpl
+
+_ytpl() {
+    local cur prev
+
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    # After "--" don't interfere with yt-dlp arguments
+    for word in "${COMP_WORDS[@]}"; do
+        [[ "$word" == "--" ]] && return 0
+    done
+
+    case "$prev" in
+        -r|--resolution)
+            COMPREPLY=( $(compgen -W "144 240 360 480 720 1080 1440 2160" -- "$cur") )
+            return
+            ;;
+
+        -s|--subs)
+            COMPREPLY=( $(compgen -W \
+                "en ar fr de es it pt ru ja ko zh zh-CN zh-TW nl tr pl uk" \
+                -- "$cur") )
+            return
+            ;;
+
+        --config)
+            COMPREPLY=( $(compgen -f -- "$cur") )
+            return
+            ;;
+    esac
+
+    # Options
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "
+            -r
+            --resolution
+            -s
+            --subs
+            --config
+            --auto-load
+            --cli
+            -h
+            --help
+            -v
+            --version
+            --
+        " -- "$cur") )
+        return
+    fi
+}
+
+complete -F _ytpl ytpl
