@@ -1,0 +1,28 @@
+#!/bin/bash
+
+# Define paths (Change these to your actual paths)
+# Use absolute paths to avoid issues with relative links
+SOURCE="$1"
+DEST="$2"
+
+# Ensure destination exists
+mkdir -p "$DEST"
+
+# Loop through all files in the source folder (non-recursive for flat structure)
+# If you need subfolders, see the note below.
+for file in "$SOURCE"/*; do
+    if [ -f "$file" ]; then
+        filename=$(basename "$file")
+        target_link="$DEST/$filename"
+
+        # Check if link already exists to avoid errors
+        if [ ! -e "$target_link" ] && [ ! -L "$target_link" ]; then
+            ln -s "$file" "$target_link"
+            echo "Linked: $filename"
+        else
+            echo "Skipped (exists): $filename"
+        fi
+    fi
+done
+
+echo "Done."   

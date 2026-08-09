@@ -1,0 +1,32 @@
+#!/bin/bash
+nmcli c edit "Wired connection 1"
+college() {
+  host="$1"
+  if [ -z "$host" ]; then
+    host=99
+  fi
+  remove ipv4.addresses
+  remove ipv4.dns
+  set ipv4.addresses 10.65.0."$host"/26
+  set ipv4.dns 172.19.2.2, 1.1.1.1
+}
+share() {
+  host="$1"
+  if [ -z "$host" ]; then
+    host=1
+  fi
+  remove ipv4.addresses
+  set ipv4.addresses 192.168.1."$host"/24
+}
+show-help() {
+  echo "help"
+}
+if [ -z "$1" ]; then
+  show-help
+elif [ "$1" = "c" ] || [ "$1" = "college" ]; then
+  college "$2"
+elif [ "$1" = "s" ] || [ "$1" = "share" ]; then
+  share "$2"
+else
+  echo "wrong command"
+fi

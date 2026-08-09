@@ -23,6 +23,9 @@ find_tcpip_hosts() {
 choose_hosts() {
   gum choose --no-limit
 }
+host_tcpip() {
+  adb tcpip 5555
+}
 open_mobile() {
   local ip
 
@@ -38,6 +41,10 @@ main() {
   if [ -z "$SCRCPY_PATH" ]; then
     SCRCPY_PATH="$HOME/Documents/Apps/scrcpy-linux-x86_64-v4.0"
   fi
+  if [ "$1" = "host" ] || [ "$1" = "h" ]; then
+    host_tcpip
+    exit
+  fi
   local hosts
 
   hosts="$(get_neighbors | find_tcpip_hosts || true)"
@@ -51,4 +58,4 @@ main() {
     choose_hosts |
     open_mobile
 }
-main
+main "$@"

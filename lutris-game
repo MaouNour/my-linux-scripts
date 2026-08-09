@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+
+import sqlite3
+import re
+import sys
+from pathlib import Path
+
+
+LUTRIS_DB = Path.home() / ".local/share/lutris/pga.db"
+
+
+def get_lutris_games():
+    conn = sqlite3.connect(LUTRIS_DB)
+
+    try:
+        cursor = conn.execute("""
+            SELECT name
+            FROM games
+            WHERE name IS NOT NULL
+            ORDER BY name COLLATE NOCASE
+        """)
+
+        return [row[0].strip() for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_existing_games(path):
+    if not path.exists():
+        return set()
+
+    text = path.read_text(encoding="utf-8")
+
+    games = re.findall(
+        r"(?im)^name\s*:\s*(.+?)\s*$",
+        text
+    )
+
+    return {
+        game.strip().casefold()
+        for game in games
+    }
+
+
+def make_entry(name):
+    return f"""name : {name}
+cracker/repacker:
+steps:
+issues:
+works out of the box
+"""
+
+
+def main():
+    if len(sys.argv) != 2:
+        print(f"Usage: {sys.argv[0]} FILE")
+        sys.exit(1)
+
+    output = Path(sys.argv[1])
+
+    if not LUTRIS_DB.exists():
+        print(f"Lutris database not found:")
+        print(LUTRIS_DB)
+        sys.exit(1)
+
+    lutris_games = get_lutris_games()
+    existing_games = get_existing_games(output)
+
+    new_games = [
+        game
+        for game in lutris_games
+        if game.casefold() not in existing_games
+    ]
+
+    if not new_games:
+        print("No new games.")
+        return
+
+    with output.open("a", encoding="utf-8") as f:
+        if output.exists() and output.stat().st_size > 0:
+            f.write("\n\n")
+
+        for i, game in enumerate(new_games):
+            f.write(make_entry(game))
+
+            if i != len(new_games) - 1:
+                f.write("\n\n")
+
+    print(f"Added {len(new_games)} new games:")
+
+    for game in new_games:
+        print(f"  + {game}")
+
+
+if __name__ == "__main__":
+    main()
