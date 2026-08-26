@@ -1,14 +1,8 @@
 #!/bin/bash
-title=""
-icon=""
-command=""
 if [ "$(virsh domstate RDPWindows)" == "running" ]; then
-  title="stop"
-  icon="🟢"
   command="virsh shutdown RDPWindows"
+  echo "{\"title\":\"🟢 Stop RDP\",\"command\":\"$command\"}"
 else
-  title="start"
-  icon="🔴"
   command="virsh start RDPWindows"
+  echo "{\"title\":\"🔴 Start RDP\",\"command\":\"$command\"}"
 fi
-echo "{\"title\":\"$title\",\"icon\":\"$icon\",\"command\":\"$command\"}"
