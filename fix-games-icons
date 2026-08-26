@@ -1,0 +1,8 @@
+#!/bin/bash
+GAME_NAME="$1"
+window="$(xdotool search --name "^$GAME_NAME$" | head -1)"
+while [ -z "$window" ]; do
+  sleep 0.2
+  window="$(xdotool search --name "^$GAME_NAME$" | head -1)"
+done
+xprop -id "$window" -f WM_CLASS 8s -set WM_CLASS "$GAME_NAME"

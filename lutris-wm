@@ -1,0 +1,20 @@
+#!/bin/bash
+
+"$@" &
+game_pid=$!
+
+window=""
+echo "GAME NAME: $GAME_NAME" >>/tmp/lutris-wmclass.log
+while [ -z "$window" ] && kill -0 "$game_pid" 2>/dev/null; do
+  window="$(xdotool search --name "^$GAME_NAME$" 2>/dev/null | head -1)"
+
+  if [ -z "$window" ]; then
+    sleep 0.2
+  fi
+done
+
+if [ -n "$window" ]; then
+  xprop -id "$window" -f WM_CLASS 8s -set WM_CLASS "$GAME_NAME"
+fi
+
+wait "$game_pid"
