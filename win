@@ -1,0 +1,35 @@
+#!/bin/bash
+topic="$1"
+option="$2"
+case $topic in
+"network" | "net" | "n")
+  if sudo iptables -C FORWARD -s 192.168.122.0/24 -d 0.0.0.0/0 -j DROP 2>/dev/null; then
+    state="disconnected"
+  else
+    state="connected"
+  fi
+  if [[ "$option" = "stop" || "$option" = "drop" ]]; then
+    sudo iptables -A FORWARD -s 192.168.122.0/24 -d 0.0.0.0/0 -j DROP
+  elif [[ "$option" = "start" || "$option" = "connect" ]]; then
+    sudo iptables -D FORWARD -s 192.168.122.0/24 -d 0.0.0.0/0 -j DROP
+  else
+    echo "Current State: $state"
+  fi
+  ;;
+"vm" | "VM" | "run" | "stop" | "start")
+  if [[ "$option" = "start" || "$option" = "poweron" || "$option" = "p" || "$option" = "s" || "$topic" = "start" ]]; then
+    virsh start RDPWindows
+  elif [[ "$option" = "stop" || "$option" = "shutdown" || "$option" = "poweroff" || "$topic" = "stop" ]]; then
+    virsh shutdown RDPWindows
+  elif [[ "$option" = "restart" || "$option" = "reboot" || "$option" = "r" || "$topic" = "restart" ]]; then
+    virsh reset RDPWindows
+  elif [[ "$option" = "kill" || "$option" = "force-shutdown" || "$topic" = "k" || "$topic" = "kill" ]]; then
+    virsh destroy RDPWindows
+  else
+    "$HOME/bin/vm-status"
+  fi
+  ;;
+*)
+  echo "help"
+  ;;
+esac

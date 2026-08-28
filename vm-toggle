@@ -1,0 +1,8 @@
+#!/bin/bash
+if [ "$(virsh domstate RDPWindows)" == "running" ]; then
+  command="virsh shutdown RDPWindows"
+  echo "{\"title\":\"🟢 Stop RDP\",\"command\":\"$command\"}"
+else
+  command="virsh start RDPWindows"
+  echo "{\"title\":\"🔴 Start RDP\",\"command\":\"$command\"}"
+fi
