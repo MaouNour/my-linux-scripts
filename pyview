@@ -1,17 +1,40 @@
 #!/usr/bin/env python3
-"""pview – frameless pywebview with session persistence (tracks in-window navigation)."""
 import sys
 import os
+import sqlite3
+import argparse
+import tempfile
 import webview
 
-STATE_FILE = os.path.expanduser("~/.config/pview/last_url")
+CONFIG_DIR = os.path.expanduser("~/.config/pyview")
+STATE_FILE = os.path.join(CONFIG_DIR, "last_url")
+HISTORY_DB = os.path.join(CONFIG_DIR, "history.db")
+
+
+def connect_db():
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    return sqlite3.connect(HISTORY_DB)
+
 
 def save_url(url):
     if not url:
         return
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+
     with open(STATE_FILE, "w") as f:
         f.write(url)
+
+    with connect_db() as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS history (
+                id INTEGER PRIMARY KEY,
+                url TEXT NOT NULL,
+                visited DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        db.execute("INSERT INTO history (url) VALUES (?)", (url,))
+
 
 def load_url():
     try:
@@ -20,15 +43,52 @@ def load_url():
     except FileNotFoundError:
         return None
 
+
+def show_history():
+    if not os.path.exists(HISTORY_DB):
+        print("No history found.")
+        return
+
+    with connect_db() as db:
+        rows = db.execute(
+            "SELECT url, visited FROM history ORDER BY id DESC"
+        ).fetchall()
+
+    for url, visited in rows:
+        print(f"{visited}  {url}")
+
+
+def clear_history():
+    if os.path.exists(HISTORY_DB):
+        with connect_db() as db:
+            db.execute("DROP TABLE IF EXISTS history")
+
+    print("History cleared.")
+
+
 def main():
-    target = sys.argv[1] if len(sys.argv) > 1 else load_url()
+    if len(sys.argv) > 1 and sys.argv[1] == "history":
+        if "--clear" in sys.argv:
+            clear_history()
+        else:
+            show_history()
+        return
+
+    parser = argparse.ArgumentParser(prog="pyview")
+
+    parser.add_argument("url", nargs="?")
+    parser.add_argument("-p", "--private", action="store_true")
+
+    args = parser.parse_args()
+
+    target = args.url or load_url()
 
     if not target:
-        print("No URL given and no previous session found.")
-        sys.exit(1)
+        parser.print_help()
+        return
 
     window = webview.create_window(
-        "pview",
+        "pyview",
         target,
         width=1200,
         height=800,
@@ -36,12 +96,12 @@ def main():
         menu=[],
     )
 
-    def on_closing():
-        save_url(window.get_current_url())
+    if not args.private:
+        window.events.loaded += lambda: save_url(window.get_current_url())
 
-    window.events.closing += on_closing
+    webview.start(private_mode=args.private)
 
-    webview.start(private_mode=False)
 
 if __name__ == "__main__":
-    main()   
+    main()
+

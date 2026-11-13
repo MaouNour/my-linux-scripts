@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""pybrowser - a minimal tabbed browser.
+
+Requires: pip install PyQt6 PyQt6-WebEngine
+
+Shortcuts
+  Ctrl+Q            quit
+  Ctrl+R            reload
+  Ctrl+H            history page (opens in a new tab)
+  Ctrl+Shift+T      new tab
+  Ctrl+W            close tab
+  Ctrl+L            focus the address bar
+  Ctrl+Tab          next tab (Ctrl+Shift+Tab: previous tab)
+  Ctrl+1 .. 9       jump to tab 1-9
+  Ctrl+P / Ctrl+N   back / forward
+"""
+import sys
+import os
+import html
+import sqlite3
+import argparse
+
+from PyQt6.QtCore import QUrl
+from PyQt6.QtGui import QKeySequence, QShortcut
+from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWidgets import (
+    QApplication, QLineEdit, QMainWindow, QTabWidget, QVBoxLayout, QWidget,
+)
+
+CONFIG_DIR = os.path.expanduser("~/.config/pybrowser")
+STATE_FILE = os.path.join(CONFIG_DIR, "last_url")
+HISTORY_DB = os.path.join(CONFIG_DIR, "history.db")
+
+
+def connect_db():
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    db = sqlite3.connect(HISTORY_DB)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY,
+            url TEXT NOT NULL,
+            visited DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    return db
+
+
+def save_url(url):
+    if not url:
+        return
+
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+
+    with open(STATE_FILE, "w") as f:
+        f.write(url)
+
+    with connect_db() as db:
+        db.execute("INSERT INTO history (url) VALUES (?)", (url,))
+
+
+def load_url():
+    try:
+        with open(STATE_FILE) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return None
+
+
+def show_history():
+    if not os.path.exists(HISTORY_DB):
+        print("No history found.")
+        return
+
+    with connect_db() as db:
+        rows = db.execute(
+            "SELECT url, visited FROM history ORDER BY id DESC"
+        ).fetchall()
+
+    for url, visited in rows:
+        print(f"{visited}  {url}")
+
+
+def clear_history():
+    if os.path.exists(HISTORY_DB):
+        with connect_db() as db:
+            db.execute("DROP TABLE IF EXISTS history")
+
+    print("History cleared.")
+
+
+def history_page(limit=500):
+    """HTML page listing each visited URL once (most recent first)."""
+    with connect_db() as db:
+        rows = db.execute(
+            "SELECT url, datetime(MAX(visited), 'localtime') FROM history "
+            "GROUP BY url ORDER BY MAX(id) DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    items = "".join(
+        f'<li><a href="{html.escape(url, quote=True)}">{html.escape(url)}</a>'
+        f"<small>{visited}</small></li>"
+        for url, visited in rows
+    ) or "<li>No history yet.</li>"
+
+    return f"""<!doctype html>
+<meta charset="utf-8">
+<title>History</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{ font: 15px system-ui, sans-serif; max-width: 900px; margin: 2em auto; padding: 0 1em; }}
+  ul {{ list-style: none; padding: 0; }}
+  li {{ display: flex; justify-content: space-between; gap: 1em; padding: .35em 0; }}
+  a {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  small {{ opacity: .6; white-space: nowrap; }}
+</style>
+<h1>History</h1>
+<ul>{items}</ul>"""
+
+
+class Page(QWebEnginePage):
+    """Opens target=_blank links and window.open() popups in a new tab."""
+
+    def __init__(self, profile, parent, open_tab):
+        super().__init__(profile, parent)
+        self.open_tab = open_tab
+
+    def createWindow(self, _window_type):
+        return self.open_tab().page()
+
+
+class Browser(QMainWindow):
+    def __init__(self, url, private):
+        super().__init__()
+        self.private = private
+        # A profile created without a name is off-the-record (no cookies/cache on disk).
+        self.profile = QWebEngineProfile(self) if private else QWebEngineProfile.defaultProfile()
+
+        self.url_bar = QLineEdit()
+        self.url_bar.returnPressed.connect(self.go)
+
+        self.tabs = QTabWidget(documentMode=True, tabsClosable=True)
+        self.tabs.tabCloseRequested.connect(self.close_tab)
+        self.tabs.currentChanged.connect(self.sync_url_bar)
+
+        central = QWidget()
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self.url_bar)
+        layout.addWidget(self.tabs)
+        self.setCentralWidget(central)
+        self.resize(1200, 800)
+        self.setWindowTitle("pybrowser")
+
+        self.bind_shortcuts()
+
+        if url:
+            self.new_tab().load(QUrl.fromUserInput(url))
+        else:
+            self.blank_tab()
+
+    # --- tabs -------------------------------------------------------------
+
+    def new_tab(self):
+        view = QWebEngineView()
+        view.setPage(Page(self.profile, view, self.new_tab))
+        index = self.tabs.addTab(view, "New Tab")
+        self.tabs.setCurrentIndex(index)
+
+        view.titleChanged.connect(
+            lambda title: self.tabs.setTabText(self.tabs.indexOf(view), title[:24] or "New Tab")
+        )
+        view.urlChanged.connect(
+            lambda: view is self.tabs.currentWidget() and self.sync_url_bar()
+        )
+        view.loadFinished.connect(lambda ok: ok and self.record(view.url()))
+        return view
+
+    def blank_tab(self):
+        self.new_tab()
+        self.url_bar.setFocus()
+
+    def close_tab(self, index):
+        if self.tabs.count() == 1:
+            self.close()
+            return
+        view = self.tabs.widget(index)
+        self.tabs.removeTab(index)
+        view.deleteLater()
+
+    def step_tab(self, delta):
+        self.tabs.setCurrentIndex((self.tabs.currentIndex() + delta) % self.tabs.count())
+
+    # --- navigation / history --------------------------------------------
+
+    def view(self):
+        return self.tabs.currentWidget()
+
+    def go(self):
+        self.view().load(QUrl.fromUserInput(self.url_bar.text()))
+        self.view().setFocus()
+
+    def sync_url_bar(self, *_):
+        view = self.view()
+        if view and not self.url_bar.hasFocus():
+            url = view.url().toString()
+            self.url_bar.setText(url if url.startswith("http") else "")
+
+    def record(self, url):
+        if not self.private and url.scheme() in ("http", "https"):
+            save_url(url.toString())
+
+    def open_history(self):
+        self.new_tab().setHtml(history_page())
+
+    # --- shortcuts --------------------------------------------------------
+
+    def bind_shortcuts(self):
+        keys = {
+            "Ctrl+Q": self.close,
+            "Ctrl+R": lambda: self.view().reload(),
+            "Ctrl+H": self.open_history,
+            "Ctrl+Shift+T": self.blank_tab,
+            "Ctrl+W": lambda: self.close_tab(self.tabs.currentIndex()),
+            "Ctrl+L": self.url_bar.setFocus,
+            "Ctrl+Tab": lambda: self.step_tab(1),
+            "Ctrl+Shift+Tab": lambda: self.step_tab(-1),
+            "Ctrl+P": lambda: self.view().back(),
+            "Ctrl+N": lambda: self.view().forward(),
+        }
+        for n in range(1, 10):  # out-of-range indexes are ignored by QTabWidget
+            keys[f"Ctrl+{n}"] = lambda n=n: self.tabs.setCurrentIndex(n - 1)
+
+        for key, action in keys.items():
+            QShortcut(QKeySequence(key), self).activated.connect(action)
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "history":
+        if "--clear" in sys.argv:
+            clear_history()
+        else:
+            show_history()
+        return
+
+    parser = argparse.ArgumentParser(prog="pybrowser")
+
+    parser.add_argument("url", nargs="?")
+    parser.add_argument("-p", "--private", action="store_true")
+
+    args = parser.parse_args()
+
+    app = QApplication(sys.argv[:1])
+    window = Browser(args.url or load_url(), args.private)
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
