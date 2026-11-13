@@ -7,30 +7,88 @@ Shortcuts
   Ctrl+Q            quit
   Ctrl+R            reload
   Ctrl+H            history page (opens in a new tab)
-  Ctrl+Shift+T      new tab
+  Ctrl+I            settings page (opens in a new tab)
+  Ctrl+B            show / hide the toolbar (tabs + address bar)
+  Ctrl+Shift+T      new tab (opens the "new tab page" from settings)
   Ctrl+W            close tab
-  Ctrl+L            focus the address bar
+  Ctrl+L            focus the address bar (text that isn't a URL is searched)
   Ctrl+Tab          next tab (Ctrl+Shift+Tab: previous tab)
   Ctrl+1 .. 9       jump to tab 1-9
   Ctrl+P / Ctrl+N   back / forward
+
+Files live in ~/.config/pybrowser: settings.json, session.json, history.db
 """
 import sys
 import os
+import json
 import html
+import base64
 import sqlite3
 import argparse
+from urllib.parse import parse_qs, quote_plus, urlsplit
 
-from PyQt6.QtCore import QUrl
+from PyQt6.QtCore import QBuffer, QIODevice, Qt, QTimer, QUrl
 from PyQt6.QtGui import QKeySequence, QShortcut
-from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
+from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineUrlScheme
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
     QApplication, QLineEdit, QMainWindow, QTabWidget, QVBoxLayout, QWidget,
 )
 
 CONFIG_DIR = os.path.expanduser("~/.config/pybrowser")
-STATE_FILE = os.path.join(CONFIG_DIR, "last_url")
+SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
+SESSION_FILE = os.path.join(CONFIG_DIR, "session.json")
 HISTORY_DB = os.path.join(CONFIG_DIR, "history.db")
+
+WEB = ("http", "https")
+INTERNAL = QUrl("pybrowser://app/")  # base URL of the built-in pages (history, settings)
+
+# Registering the scheme (before QApplication exists) lets the settings form navigate to it.
+_scheme = QWebEngineUrlScheme(b"pybrowser")
+_scheme.setSyntax(QWebEngineUrlScheme.Syntax.Host)
+QWebEngineUrlScheme.registerScheme(_scheme)
+
+DEFAULTS = {
+    "decoration": "full",   # hidden | minimal | full
+    "toolbar": True,        # tab bar + address bar
+    "startup": "last",      # page | last
+    "startup_page": "https://duckduckgo.com",
+    "new_tab_page": "https://duckduckgo.com",  # empty = blank tab
+    "search_engine": "DuckDuckGo",
+}
+
+SEARCH_ENGINES = {
+    "DuckDuckGo": "https://duckduckgo.com/?q={}",
+    "Google": "https://www.google.com/search?q={}",
+    "Brave": "https://search.brave.com/search?q={}",
+    "Bing": "https://www.bing.com/search?q={}",
+    "Startpage": "https://www.startpage.com/do/search?q={}",
+}
+
+_WINDOW = Qt.WindowType.Window
+DECORATIONS = {
+    "hidden": _WINDOW | Qt.WindowType.FramelessWindowHint,
+    # title bar with only a close button (how strictly this is honoured depends on the WM)
+    "minimal": (_WINDOW | Qt.WindowType.CustomizeWindowHint
+                | Qt.WindowType.WindowTitleHint | Qt.WindowType.WindowCloseButtonHint),
+    "full": _WINDOW,
+}
+
+
+# --- storage ---------------------------------------------------------------
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
 
 
 def connect_db():
@@ -40,31 +98,28 @@ def connect_db():
         CREATE TABLE IF NOT EXISTS history (
             id INTEGER PRIMARY KEY,
             url TEXT NOT NULL,
+            title TEXT,
             visited DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    db.execute("CREATE TABLE IF NOT EXISTS icons (host TEXT PRIMARY KEY, png TEXT NOT NULL)")
+    if "title" not in [row[1] for row in db.execute("PRAGMA table_info(history)")]:
+        db.execute("ALTER TABLE history ADD COLUMN title TEXT")  # database from an older version
     return db
 
 
-def save_url(url):
-    if not url:
-        return
-
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-
-    with open(STATE_FILE, "w") as f:
-        f.write(url)
-
+def save_visit(url, title):
     with connect_db() as db:
-        db.execute("INSERT INTO history (url) VALUES (?)", (url,))
+        db.execute("INSERT INTO history (url, title) VALUES (?, ?)", (url, title))
 
 
-def load_url():
-    try:
-        with open(STATE_FILE) as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        return None
+def save_icon(host, icon):
+    buf = QBuffer()
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    icon.pixmap(32, 32).save(buf, "PNG")
+    png = base64.b64encode(buf.data().data()).decode()
+    with connect_db() as db:
+        db.execute("INSERT OR REPLACE INTO icons VALUES (?, ?)", (host, png))
 
 
 def show_history():
@@ -85,55 +140,130 @@ def clear_history():
     if os.path.exists(HISTORY_DB):
         with connect_db() as db:
             db.execute("DROP TABLE IF EXISTS history")
+            db.execute("DROP TABLE IF EXISTS icons")
 
     print("History cleared.")
 
 
+def to_url(text, search_template):
+    """Address bar input -> URL. Things that look like a URL are loaded, anything else is searched."""
+    text = text.strip()
+    host = text.split("://")[-1].split("/")[0].split(":")[0]
+    looks_like_url = "://" in text or text.startswith("about:") or "." in host or host == "localhost"
+    if " " not in text and looks_like_url:
+        return QUrl.fromUserInput(text)
+    return QUrl(search_template.format(quote_plus(text)))
+
+
+# --- built-in pages --------------------------------------------------------
+
+PAGE_CSS = """
+  :root { color-scheme: light dark; }
+  body { font: 15px system-ui, sans-serif; max-width: 900px; margin: 2em auto; padding: 0 1em; }
+  ul { list-style: none; padding: 0; }
+  li { display: flex; align-items: center; gap: .7em; padding: .35em 0; }
+  li a { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  li img, .logo { width: 16px; height: 16px; flex: none; font-size: 14px; line-height: 16px; }
+  small { opacity: .6; white-space: nowrap; }
+  .host { margin-right: auto; }
+  fieldset { margin: 0 0 1em; padding: .8em 1em; border: 1px solid #8884; border-radius: 8px; }
+  label { display: block; padding: .2em 0; }
+  input[type=text] { width: 100%; box-sizing: border-box; margin-top: .6em; padding: .4em; font: inherit; }
+  button { font: inherit; padding: .4em 1.4em; }
+"""
+
+
+def page(title, body):
+    return (f'<!doctype html><meta charset="utf-8"><title>{title}</title>'
+            f"<style>{PAGE_CSS}</style><h1>{title}</h1>{body}")
+
+
 def history_page(limit=500):
-    """HTML page listing each visited URL once (most recent first)."""
+    """Each visited page once (most recent first), linked by its title and favicon."""
     with connect_db() as db:
         rows = db.execute(
-            "SELECT url, datetime(MAX(visited), 'localtime') FROM history "
-            "GROUP BY url ORDER BY MAX(id) DESC LIMIT ?",
+            "SELECT url, title, datetime(visited, 'localtime') FROM history "
+            "WHERE id IN (SELECT MAX(id) FROM history GROUP BY url) "
+            "ORDER BY id DESC LIMIT ?",
             (limit,),
         ).fetchall()
+        icons = dict(db.execute("SELECT host, png FROM icons"))
 
-    items = "".join(
-        f'<li><a href="{html.escape(url, quote=True)}">{html.escape(url)}</a>'
-        f"<small>{visited}</small></li>"
-        for url, visited in rows
-    ) or "<li>No history yet.</li>"
+    def row(url, title, visited):
+        host = urlsplit(url).hostname or ""
+        logo = (f'<img src="data:image/png;base64,{icons[host]}">' if host in icons
+                else '<span class="logo">🌐</span>')
+        return (f'<li>{logo}<a href="{html.escape(url, quote=True)}">{html.escape(title or url)}</a>'
+                f'<small class="host">{html.escape(host)}</small><small>{visited}</small></li>')
 
-    return f"""<!doctype html>
-<meta charset="utf-8">
-<title>History</title>
-<style>
-  :root {{ color-scheme: light dark; }}
-  body {{ font: 15px system-ui, sans-serif; max-width: 900px; margin: 2em auto; padding: 0 1em; }}
-  ul {{ list-style: none; padding: 0; }}
-  li {{ display: flex; justify-content: space-between; gap: 1em; padding: .35em 0; }}
-  a {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-  small {{ opacity: .6; white-space: nowrap; }}
-</style>
-<h1>History</h1>
-<ul>{items}</ul>"""
+    items = "".join(row(*r) for r in rows) or "<li>No history yet.</li>"
+    return page("History", f"<ul>{items}</ul>")
 
+
+def settings_page(s, saved=False):
+    def radios(name, options):
+        return "".join(
+            f'<label><input type="radio" name="{name}" value="{value}"'
+            f'{" checked" if s[name] == value else ""}> {label}</label>'
+            for value, label in options
+        )
+
+    toolbar = " checked" if s["toolbar"] else ""
+    startup_page = html.escape(s["startup_page"], quote=True)
+    note = "<small>Saved ✓</small>" if saved else ""
+    new_tab_page = html.escape(s["new_tab_page"], quote=True)
+    engines = "".join(
+        f'<option{" selected" if name == s["search_engine"] else ""}>{name}</option>'
+        for name in SEARCH_ENGINES
+    )
+    return page("Settings", f"""
+<form action="pybrowser://app/save">
+  <fieldset><legend>Window decoration</legend>
+    {radios("decoration", [("hidden", "Hidden"), ("minimal", "Minimal (close button only)"), ("full", "Full")])}
+  </fieldset>
+  <fieldset><legend>Toolbar</legend>
+    <label><input type="checkbox" name="toolbar"{toolbar}> Show tabs and address bar</label>
+  </fieldset>
+  <fieldset><legend>New tab</legend>
+    <input type="text" name="new_tab_page" value="{new_tab_page}" placeholder="New tab page (leave empty for a blank tab)">
+    <label style="margin-top:.6em">Search engine (used when the address bar text isn't a URL)
+      <select name="search_engine">{engines}</select></label>
+  </fieldset>
+  <fieldset><legend>On startup</legend>
+    {radios("startup", [("page", "Open the startup page"), ("last", "Restore the last session")])}
+    <input type="text" name="startup_page" value="{startup_page}" placeholder="Startup page, e.g. https://duckduckgo.com">
+  </fieldset>
+  <button>Save</button> {note}
+</form>""")
+
+
+# --- browser ---------------------------------------------------------------
 
 class Page(QWebEnginePage):
-    """Opens target=_blank links and window.open() popups in a new tab."""
-
-    def __init__(self, profile, parent, open_tab):
-        super().__init__(profile, parent)
-        self.open_tab = open_tab
+    def __init__(self, browser, parent):
+        super().__init__(browser.profile, parent)
+        self.browser = browser
 
     def createWindow(self, _window_type):
-        return self.open_tab().page()
+        # target=_blank links and window.open() popups open in a new tab
+        return self.browser.new_tab().page()
+
+    def acceptNavigationRequest(self, url, _nav_type, _is_main_frame):
+        if url.scheme() != "pybrowser" or url.path() != "/save":
+            return True
+        # The settings form submits to pybrowser://app/save; only our own pages may do that.
+        if self.url().scheme() == "pybrowser":
+            self.browser.update_settings(parse_qs(url.query(QUrl.ComponentFormattingOption.FullyEncoded)))
+            QTimer.singleShot(0, lambda: self.setHtml(settings_page(self.browser.settings, saved=True), INTERNAL))
+        return False
 
 
 class Browser(QMainWindow):
     def __init__(self, url, private):
         super().__init__()
         self.private = private
+        self.settings = {**DEFAULTS, **read_json(SETTINGS_FILE, {})}
+        self.decoration = None
         # A profile created without a name is off-the-record (no cookies/cache on disk).
         self.profile = QWebEngineProfile(self) if private else QWebEngineProfile.defaultProfile()
 
@@ -154,18 +284,78 @@ class Browser(QMainWindow):
         self.resize(1200, 800)
         self.setWindowTitle("pybrowser")
 
+        self.apply_settings()
         self.bind_shortcuts()
 
-        if url:
-            self.new_tab().load(QUrl.fromUserInput(url))
+        urls, current = self.startup_urls(url)
+        for target in urls:
+            self.new_tab().load(self.resolve(target))
+        if urls:
+            self.tabs.setCurrentIndex(current)
         else:
-            self.blank_tab()
+            self.home_tab()
+
+    # --- startup / shutdown -------------------------------------------------
+
+    def startup_urls(self, url):
+        if url:
+            return [url], 0
+        if self.settings["startup"] == "last" and not self.private:
+            session = read_json(SESSION_FILE, {})
+            if session.get("urls"):
+                return session["urls"], session.get("current", 0)
+        start = self.settings["startup_page"]
+        return ([start] if start else []), 0
+
+    def closeEvent(self, event):
+        if not self.private:
+            urls, current = [], 0
+            for i in range(self.tabs.count()):
+                url = self.tabs.widget(i).url()
+                if url.scheme() in WEB:
+                    if i == self.tabs.currentIndex():
+                        current = len(urls)
+                    urls.append(url.toString())
+            write_json(SESSION_FILE, {"urls": urls, "current": current})
+        super().closeEvent(event)
+
+    # --- settings -----------------------------------------------------------
+
+    def apply_settings(self):
+        s = self.settings
+        if s["decoration"] in DECORATIONS and s["decoration"] != self.decoration:
+            self.decoration = s["decoration"]
+            visible = self.isVisible()  # changing window flags hides the window
+            self.setWindowFlags(DECORATIONS[self.decoration])
+            self.setVisible(visible)
+        self.url_bar.setVisible(s["toolbar"])
+        self.tabs.tabBar().setVisible(s["toolbar"])
+
+    def update_settings(self, query):
+        """Called with the parsed query string of the settings form."""
+        get = lambda key: query.get(key, [""])[0]
+        s = self.settings
+        if get("decoration") in DECORATIONS:
+            s["decoration"] = get("decoration")
+        s["startup"] = "page" if get("startup") == "page" else "last"
+        s["startup_page"] = get("startup_page").strip()
+        s["toolbar"] = "toolbar" in query
+        s["new_tab_page"] = get("new_tab_page").strip()
+        if get("search_engine") in SEARCH_ENGINES:
+            s["search_engine"] = get("search_engine")
+        write_json(SETTINGS_FILE, s)
+        self.apply_settings()
+
+    def toggle_toolbar(self):
+        self.settings["toolbar"] = not self.settings["toolbar"]
+        write_json(SETTINGS_FILE, self.settings)
+        self.apply_settings()
 
     # --- tabs -------------------------------------------------------------
 
     def new_tab(self):
         view = QWebEngineView()
-        view.setPage(Page(self.profile, view, self.new_tab))
+        view.setPage(Page(self, view))
         index = self.tabs.addTab(view, "New Tab")
         self.tabs.setCurrentIndex(index)
 
@@ -175,12 +365,19 @@ class Browser(QMainWindow):
         view.urlChanged.connect(
             lambda: view is self.tabs.currentWidget() and self.sync_url_bar()
         )
-        view.loadFinished.connect(lambda ok: ok and self.record(view.url()))
+        view.loadFinished.connect(lambda ok: ok and self.record(view))
+        view.iconChanged.connect(lambda icon: self.record_icon(view, icon))
         return view
 
-    def blank_tab(self):
-        self.new_tab()
+    def home_tab(self):
+        """A new tab showing the configured new-tab page (blank if none), ready for typing."""
+        view = self.new_tab()
+        if self.settings["new_tab_page"]:
+            view.load(self.resolve(self.settings["new_tab_page"]))
         self.url_bar.setFocus()
+
+    def open_page(self, content):
+        self.new_tab().setHtml(content, INTERNAL)
 
     def close_tab(self, index):
         if self.tabs.count() == 1:
@@ -198,9 +395,14 @@ class Browser(QMainWindow):
     def view(self):
         return self.tabs.currentWidget()
 
+    def resolve(self, text):
+        engine = SEARCH_ENGINES.get(self.settings["search_engine"], SEARCH_ENGINES["DuckDuckGo"])
+        return to_url(text, engine)
+
     def go(self):
-        self.view().load(QUrl.fromUserInput(self.url_bar.text()))
-        self.view().setFocus()
+        if self.url_bar.text().strip():
+            self.view().load(self.resolve(self.url_bar.text()))
+            self.view().setFocus()
 
     def sync_url_bar(self, *_):
         view = self.view()
@@ -208,12 +410,14 @@ class Browser(QMainWindow):
             url = view.url().toString()
             self.url_bar.setText(url if url.startswith("http") else "")
 
-    def record(self, url):
-        if not self.private and url.scheme() in ("http", "https"):
-            save_url(url.toString())
+    def record(self, view):
+        if not self.private and view.url().scheme() in WEB:
+            save_visit(view.url().toString(), view.title())
 
-    def open_history(self):
-        self.new_tab().setHtml(history_page())
+    def record_icon(self, view, icon):
+        url = view.url()
+        if not self.private and url.scheme() in WEB and not icon.isNull():
+            save_icon(url.host(), icon)
 
     # --- shortcuts --------------------------------------------------------
 
@@ -221,8 +425,10 @@ class Browser(QMainWindow):
         keys = {
             "Ctrl+Q": self.close,
             "Ctrl+R": lambda: self.view().reload(),
-            "Ctrl+H": self.open_history,
-            "Ctrl+Shift+T": self.blank_tab,
+            "Ctrl+H": lambda: self.open_page(history_page()),
+            "Ctrl+I": lambda: self.open_page(settings_page(self.settings)),
+            "Ctrl+B": self.toggle_toolbar,
+            "Ctrl+Shift+T": self.home_tab,
             "Ctrl+W": lambda: self.close_tab(self.tabs.currentIndex()),
             "Ctrl+L": self.url_bar.setFocus,
             "Ctrl+Tab": lambda: self.step_tab(1),
@@ -253,7 +459,7 @@ def main():
     args = parser.parse_args()
 
     app = QApplication(sys.argv[:1])
-    window = Browser(args.url or load_url(), args.private)
+    window = Browser(args.url, args.private)
     window.show()
     sys.exit(app.exec())
 
