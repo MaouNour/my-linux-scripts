@@ -1,15 +1,33 @@
 #!/usr/bin/env python3
-"""pview – open HTML/URL in a frameless pywebview window."""
+"""pview – frameless pywebview with session persistence (tracks in-window navigation)."""
 import sys
+import os
 import webview
 
+STATE_FILE = os.path.expanduser("~/.config/pview/last_url")
+
+def save_url(url):
+    if not url:
+        return
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    with open(STATE_FILE, "w") as f:
+        f.write(url)
+
+def load_url():
+    try:
+        with open(STATE_FILE) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return None
+
 def main():
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <file.html | url>")
+    target = sys.argv[1] if len(sys.argv) > 1 else load_url()
+
+    if not target:
+        print("No URL given and no previous session found.")
         sys.exit(1)
 
-    target = sys.argv[1]
-    webview.create_window(
+    window = webview.create_window(
         "pview",
         target,
         width=1200,
@@ -17,8 +35,13 @@ def main():
         frameless=True,
         menu=[],
     )
-    webview.start(private_mode=False)
 
+    def on_closing():
+        save_url(window.get_current_url())
+
+    window.events.closing += on_closing
+
+    webview.start(private_mode=False)
 
 if __name__ == "__main__":
     main()   
