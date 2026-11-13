@@ -1,0 +1,27 @@
+#!/bin/bash
+LOG_LOCATION="$HOME/.local/share/updates"
+if [ -f "$LOG_LOCATION" ]; then
+  mkdir -p "$LOG_LOCATION"
+fi
+dnf-update() {
+  failure_messages=("Failed to download packages","")
+  log=$(sudo dnf update -y)
+  echo $log >"$LOG_LOCATION/dnf"
+  for i in failure_messsages; do
+    if [ -z $(echo "$log" | grep "$i") ]; then
+      dnf-update
+    fi
+  done
+}
+flatpak-update() {
+  failure_messages=("Failed to download packages","")
+  log=$(flatpak update -y)
+  echo $log >"$LOG_LOCATION/flatpak"
+  for i in failure_messsages; do
+    if [ -z $(echo "$log" | grep "$i") ]; then
+      flatpak-update
+    fi
+  done
+}
+dnf-update
+flatpak-update

@@ -1,0 +1,3 @@
+#!/bin/bash
+arg="$1"
+watch -n 1 -d "journalctl -t $arg | tail -1"

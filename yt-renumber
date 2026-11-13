@@ -1,0 +1,16 @@
+#!/bin/bash
+directory="$1"
+shamt="$2"
+for file in "$directory"/*; do
+  [ -e "$file" ] || continue
+
+  base="${file##*/}"
+  number="${base%% *}"
+  title="${base#* - }"
+
+  width=${#number}
+  new_number=$(printf "%0${width}d" $((10#$number + shamt)))
+
+  new_file="$new_number - $title"
+  mv -- "$file" "$directory/$new_file"
+done

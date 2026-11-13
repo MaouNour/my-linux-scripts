@@ -1,0 +1,61 @@
+#!/bin/bash
+
+HOSTS="/etc/hosts"
+STEAM_CFG="$HOME/.steam/steam/steam.cfg"
+
+BLOCK_ENTRIES=(
+    "127.0.0.1 client-download.steampowered.com"
+    "127.0.0.1 media.steampowered.com"
+)
+
+CONFIG_ENTRY="BootStrapperInhibitAll=Enable"
+
+case "$1" in
+    disable)
+        for entry in "${BLOCK_ENTRIES[@]}"; do
+            grep -qxF "$entry" "$HOSTS" ||
+                echo "$entry" | sudo tee -a "$HOSTS" > /dev/null
+        done
+
+        mkdir -p "$(dirname "$STEAM_CFG")"
+        grep -qxF "$CONFIG_ENTRY" "$STEAM_CFG" 2>/dev/null ||
+            echo "$CONFIG_ENTRY" >> "$STEAM_CFG"
+
+        echo "Steam automatic updates disabled."
+        ;;
+
+    enable)
+        for entry in "${BLOCK_ENTRIES[@]}"; do
+            sudo sed -i "\|^${entry}$|d" "$HOSTS"
+        done
+
+        if [[ -f "$STEAM_CFG" ]]; then
+            sed -i "\|^${CONFIG_ENTRY}$|d" "$STEAM_CFG"
+        fi
+
+        echo "Steam automatic updates enabled."
+        ;;
+
+    status)
+        echo "Steam update blocking status:"
+
+        for entry in "${BLOCK_ENTRIES[@]}"; do
+            if grep -qxF "$entry" "$HOSTS"; then
+                echo "[ON]  $entry"
+            else
+                echo "[OFF] $entry"
+            fi
+        done
+
+        if grep -qxF "$CONFIG_ENTRY" "$STEAM_CFG" 2>/dev/null; then
+            echo "[ON]  Steam config update inhibition"
+        else
+            echo "[OFF] Steam config update inhibition"
+        fi
+        ;;
+
+    *)
+        echo "Usage: $0 {disable|enable|status}"
+        exit 1
+        ;;
+esac

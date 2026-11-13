@@ -1,5 +1,6 @@
 #!/bin/bash
 FOLDER="$1"
+echo "Scanning Folder $FOLDER"
 if [ -z "$FOLDER" ]; then
   FOLDER="."
 fi

@@ -1,0 +1,29 @@
+#!/bin/bash
+set-current-directory-as-prefix() {
+  directory=$(get_curr_dir)
+  export WINEPREFIX=$directory
+}
+set-32bit-prefix() {
+  export WINEARCH=win32
+}
+choose-wine-ver() {
+  echo "Ver"
+  wineprefixes=()
+  winename=()
+  winepath=()
+  wines=()
+  IFS=$'\n'
+  for i in $(cat $HOME/.local/share/wineprefixes/versions); do
+    wineprefixes+=("$i")
+    IFS=":"
+    winename+=("${i[0]}")
+    winepath+=("${i[1]}")
+    #wines["${i[0]}"]="${i[1]}"
+    IFS=$'\n'
+  done
+  echo $winepath
+}
+register-wine-ver() {
+  echo "Reg"
+}
+choose-wine-ver
